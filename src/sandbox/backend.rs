@@ -210,6 +210,14 @@ pub trait SandboxBackend: Send + 'static {
     /// workload is submitted.
     async fn wait_for_ready(&self) -> Result<()>;
 
+    /// Initialize a fresh Compose workload before publishing Running.
+    async fn initialize_compose(
+        &mut self,
+        _bootstrap: &crate::compose::ComposeBootstrap,
+    ) -> Result<()> {
+        anyhow::bail!("this backend does not support Compose sandboxes")
+    }
+
     /// Pause the sandbox and capture its state for later resume.
     ///
     /// After this call the caller is expected to invoke [`stop`][Self::stop]

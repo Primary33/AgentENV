@@ -361,6 +361,51 @@ impl SandboxBackend for FirecrackerSandbox {
         FirecrackerSandbox::wait_for_ready(self).await
     }
 
+    async fn initialize_compose(
+        &mut self,
+        bootstrap: &crate::compose::ComposeBootstrap,
+    ) -> Result<()> {
+        let envd = self.envd_instance.clone().context("envd is not running")?;
+        let remaining = bootstrap
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "Compose startup deadline exceeded");
+        let mut input = serde_json::to_vec(&bootstrap.plan)?;
+        input.push(b'\n');
+        let deadline = bootstrap.deadline;
+        // Like guest filesystem sync, envd's streaming client needs a local
+        // future behind this Send lifecycle interface.
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                tokio::time::timeout_at(deadline, async move {
+                    let executor = Executor::new(envd).with_root_user();
+                    let seconds = remaining.as_secs_f64().to_string();
+                    let mut process = executor
+                        .start_process(
+                            "/usr/local/bin/aenv-compose-start",
+                            &[&seconds],
+                            &crate::sandbox::ProcessOpts::default()
+                                .with_cwd("/")
+                                .with_timeout(remaining),
+                        )
+                        .await?;
+                    process.send_stdin(&input).await?;
+                    let output = process.wait().await?;
+                    anyhow::ensure!(
+                        output.exit_code == 0,
+                        "Compose startup failed: {}",
+                        output.stderr
+                    );
+                    Ok(())
+                })
+                .await
+                .context("Compose startup deadline exceeded")?
+            })
+        })
+        .await
+        .context("Compose initialization task failed")?
+    }
+
     /// Pauses the VM and returns the paused state wrapped as a [`PausedSandboxState`].
     async fn pause(
         &mut self,
