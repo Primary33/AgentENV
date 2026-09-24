@@ -49,6 +49,7 @@ pub enum MockOperation {
     Start,
     StartNowait,
     WaitForReady,
+    InitializeCompose,
     Pause,
     Resume,
     Snapshot,
@@ -332,6 +333,16 @@ impl SandboxBackend for MockSandboxBackend {
 
     async fn wait_for_ready(&self) -> Result<()> {
         self.behavior.apply_async(MockOperation::WaitForReady).await
+    }
+
+    async fn initialize_compose(
+        &mut self,
+        _input: &[u8],
+        _deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        self.behavior
+            .apply_async(MockOperation::InitializeCompose)
+            .await
     }
 
     async fn pause(

@@ -77,7 +77,7 @@ impl HoldNamespace {
 pub(crate) struct ImageCacheService {
     commit_store: PathBuf,
     index_dir: PathBuf,
-    config_dir: PathBuf,
+    pub(super) config_dir: PathBuf,
     metadata_store_path: PathBuf,
     staging_dir: PathBuf,
     metadata_store: OnceCell<ImageCacheMetadataStore>,

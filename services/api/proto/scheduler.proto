@@ -34,6 +34,8 @@ message ScheduleRequestHint {
     NewColdSandboxHint new_cold_sandbox = 1;
     NewSandboxHint new_sandbox = 2;
   }
+  // Local image dependencies. Placement must have every digest in its cache.
+  repeated string required_images = 3;
 }
 
 // NewColdSandboxHint describes a POST /sandboxes-cold request.
@@ -168,6 +170,8 @@ message HeartbeatRequest {
   NodeSnapshot snapshot = 7;
   repeated string sandbox_ids = 8;
   P2pEndpoint p2p_endpoint = 9;
+  // Complete inventory of usable, unscoped local image manifest digests.
+  repeated string local_images = 10;
 }
 
 message HeartbeatResponse {

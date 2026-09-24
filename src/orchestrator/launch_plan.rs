@@ -8,12 +8,20 @@ use crate::sandbox::{
 use crate::snapshot::RunnableSnapshot;
 use crate::types::{SandboxId, SandboxResources};
 
+/// Validated startup frame, used only on the initial launch, never on restore.
+#[derive(Debug)]
+pub(super) struct ComposeBootstrap {
+    pub input: Vec<u8>,
+    pub deadline: tokio::time::Instant,
+}
+
 pub(super) struct CreateLaunchPlan {
     pub sandbox_id: SandboxId,
     pub source: CreateLaunchSource,
     pub launch_config: SandboxLaunchConfig,
     pub metadata: SandboxMetadata,
     pub timeout: NewTimeout,
+    pub compose: Option<ComposeBootstrap>,
 }
 
 pub(super) enum CreateLaunchSource {
@@ -39,6 +47,20 @@ pub(super) enum LaunchPlan {
 }
 
 impl LaunchPlan {
+    pub(super) fn with_compose(mut self, compose: Option<ComposeBootstrap>) -> Self {
+        if let Self::Create(plan) = &mut self {
+            plan.compose = compose;
+        }
+        self
+    }
+
+    pub(super) fn compose(&self) -> Option<&ComposeBootstrap> {
+        match self {
+            Self::Create(plan) => plan.compose.as_ref(),
+            Self::Resume(_) => None,
+        }
+    }
+
     pub(super) fn for_create_from_snapshot(
         sandbox_id: SandboxId,
         snapshot: Box<RunnableSnapshot>,
@@ -49,6 +71,7 @@ impl LaunchPlan {
         Self::Create(Box::new(CreateLaunchPlan {
             sandbox_id,
             source: CreateLaunchSource::Snapshot { snapshot },
+            compose: None,
             launch_config,
             metadata,
             timeout,
@@ -67,6 +90,7 @@ impl LaunchPlan {
             source: CreateLaunchSource::Fresh {
                 build_spec: Box::new(build_spec),
             },
+            compose: None,
             launch_config,
             metadata,
             timeout,

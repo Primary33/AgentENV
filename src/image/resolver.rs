@@ -106,6 +106,9 @@ impl ImageResolver {
             image_config_path, ..
         } = source.cached_config().await?
         {
+            // Older cache entries may lack resolution metadata. Persist the
+            // freshly fetched config before reporting a digest-only import ready.
+            source.write_metadata(metadata.clone()).await?;
             return Ok(resolved_from_cached_config(
                 &fetched.manifest_digest,
                 image_config_path,
@@ -188,7 +191,47 @@ impl ImageResolver {
             .map(Some)
     }
 
+    /// Resolve an image-only template build's import from the node-local cache
+    /// by its manifest digest, without contacting any registry.
+    pub(crate) async fn resolve_local(
+        &self,
+        manifest_digest: &str,
+    ) -> ImageResult<ResolvedBlockImage> {
+        super::buildkit::validate_digest(manifest_digest).map_err(|error| {
+            ImageError::InvalidReference {
+                reason: error.to_string(),
+            }
+        })?;
+        // Imports from `resolve_buildkit` are written without a repository
+        // scope, so the lookup must use the same identity.
+        let source = self.store.open(manifest_digest, None).await?;
+        if let CachedImageConfig::Found {
+            image_config_path,
+            metadata: Some(metadata),
+        } = source.cached_config().await?
+        {
+            return Ok(resolved_from_cached_config(
+                manifest_digest,
+                image_config_path,
+                *metadata,
+            ));
+        }
+        Err(ImageError::NotFound {
+            reason: format!(
+                "image '{manifest_digest}' is not imported in this cluster; build it with aenv build --compose first or use a registry reference"
+            ),
+        })
+    }
+
     pub async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage> {
+        // A bare manifest digest addresses an image-only build's import in the
+        // node-local cache. This deliberately bypasses the registry manifest
+        // fetch and the allowed_registries policy: the content is already on
+        // the node and content-addressed, so no registry is involved.
+        let trimmed = image_ref.trim();
+        if super::buildkit::validate_digest(trimmed).is_ok() {
+            return self.resolve_local(trimmed).await;
+        }
         let candidates = image_ref_candidates(
             image_ref,
             &self.search_registries,
@@ -596,6 +639,7 @@ fn overlaybd_image_config_json(resolved: &ResolvedImage) -> Value {
 mod tests {
     use super::*;
     use crate::cfg::{ImageConfig, ImageResolverConfig};
+    use crate::image::cache::ImageCacheService;
     use tempfile::TempDir;
 
     fn test_resolver_with_search(temp: &TempDir, search_registries: Vec<&str>) -> ImageResolver {
@@ -1210,5 +1254,131 @@ mod tests {
             Some(expected_layer_dir.as_str())
         );
         assert!(config["lowers"][0].get("cacheFile").is_none());
+    }
+
+    fn local_resolver(temp: &TempDir) -> (ImageResolver, Arc<ImageCacheService>) {
+        let mut config = AppConfig::default();
+        ImageConfig::normalize(&mut config.image, temp.path(), temp.path());
+        let cache = ImageCacheService::shared_from_app_config(&config);
+        (ImageResolver::new(&config), cache)
+    }
+
+    async fn seed_local_image(
+        temp: &TempDir,
+        cache: &Arc<ImageCacheService>,
+        manifest_digest: &str,
+        repository_scope: Option<&str>,
+    ) -> PathBuf {
+        // A cached config is usable only with a sealed lower backed by a real
+        // file, mirroring what a successful conversion publishes.
+        let layer = temp
+            .path()
+            .join(format!("layer-{}", &manifest_digest[7..15]));
+        std::fs::write(&layer, b"sealed-layer").expect("write layer");
+        let conversion = cache
+            .begin_image_conversion(manifest_digest, repository_scope)
+            .await
+            .expect("begin conversion");
+        cache
+            .publish_image_config(
+                manifest_digest,
+                repository_scope,
+                &json!({
+                    "repoBlobUrl": "",
+                    "lowers": [{
+                        "file": layer.display().to_string(),
+                        "digest": "sha256:layer",
+                        "size": 12
+                    }],
+                    "upper": {},
+                    "resultFile": ""
+                }),
+                ImageResolutionMetadata {
+                    base_context: ImageBaseContext::default(),
+                    raw_config: Some(json!({"Cmd": ["/server"]})),
+                },
+                conversion,
+            )
+            .await
+            .expect("publish source image config")
+    }
+
+    #[tokio::test]
+    async fn resolve_local_digest_hits_node_local_cache_without_registry() {
+        let temp = TempDir::new().expect("tempdir");
+        let (resolver, cache) = local_resolver(&temp);
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let path = seed_local_image(&temp, &cache, &digest, None).await;
+        assert_eq!(
+            cache.local_image_digests().await.unwrap(),
+            vec![digest.clone()]
+        );
+        // Repository-scoped entries are distinct cache identities and must not
+        // satisfy the scope-less local lookup.
+        let scoped = format!("sha256:{}", "cd".repeat(32));
+        seed_local_image(&temp, &cache, &scoped, Some("library/app")).await;
+        assert_eq!(
+            cache.local_image_digests().await.unwrap(),
+            vec![digest.clone()]
+        );
+
+        let resolved = resolver
+            .resolve(&digest)
+            .await
+            .expect("resolve local import");
+        assert_eq!(resolved.image_ref, digest);
+        assert_eq!(resolved.overlaybd_config_path, path);
+        assert_eq!(resolved.raw_config, Some(json!({"Cmd": ["/server"]})));
+
+        let error = resolver
+            .resolve(&scoped)
+            .await
+            .expect_err("scoped entry must not resolve locally");
+        assert!(matches!(error, ImageError::NotFound { .. }));
+        // Missing metadata and evicted source configs must disappear from the
+        // next inventory, while scoped registry entries remain excluded.
+        let metadata_path = path.with_file_name(format!(
+            "{}.metadata.json",
+            path.file_stem().unwrap().to_str().unwrap()
+        ));
+        let metadata = tokio::fs::read(&metadata_path).await.unwrap();
+        tokio::fs::write(&metadata_path, b"invalid-json")
+            .await
+            .unwrap();
+        assert!(cache.local_image_digests().await.unwrap().is_empty());
+        tokio::fs::write(&metadata_path, metadata).await.unwrap();
+        tokio::fs::remove_file(&path).await.unwrap();
+        assert!(cache.local_image_digests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_local_digest_miss_is_an_actionable_user_error() {
+        let temp = TempDir::new().expect("tempdir");
+        let (resolver, _cache) = local_resolver(&temp);
+        let digest = format!("sha256:{}", "ef".repeat(32));
+
+        let error = resolver
+            .resolve(&digest)
+            .await
+            .expect_err("unknown digest must miss");
+        assert!(matches!(error, ImageError::NotFound { .. }));
+        assert!(error.is_user_error());
+        let message = error.to_string();
+        assert!(message.contains(&digest));
+        assert!(message.contains("not imported in this cluster"));
+        assert!(message.contains("aenv build --compose"));
+    }
+
+    #[tokio::test]
+    async fn resolve_local_rejects_malformed_digest() {
+        let temp = TempDir::new().expect("tempdir");
+        let (resolver, _cache) = local_resolver(&temp);
+
+        let error = resolver
+            .resolve_local("sha256:not-a-digest")
+            .await
+            .expect_err("malformed digest must be rejected");
+        assert!(matches!(error, ImageError::InvalidReference { .. }));
+        assert!(error.is_user_error());
     }
 }

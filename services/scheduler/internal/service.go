@@ -95,6 +95,11 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 
 	eligible := FilterByResourceLimit(rich, s.resourceLimit)
 
+	eligible, err = s.filterLocalImages(eligible, req.GetHint().GetRequiredImages())
+	if err != nil {
+		return nil, err
+	}
+
 	node, selectErr := s.strategy.Select(eligible, req.GetHint())
 	if selectErr != nil {
 		s.logger.Debug("scheduler selection failed",

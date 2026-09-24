@@ -22,6 +22,7 @@ use crate::identity::NodeIdentity;
 /// Configuration can disable this service entirely at the server wiring layer.
 #[derive(Clone)]
 pub struct ObservabilityService {
+    pub(super) heartbeat: Arc<super::heartbeat::HeartbeatBarrier>,
     orchestrator: Arc<Orchestrator>,
     identity: NodeIdentity,
     machine_info: MachineInfo,
@@ -45,6 +46,7 @@ impl ObservabilityService {
             None
         };
         Self {
+            heartbeat: Arc::new(super::heartbeat::HeartbeatBarrier::default()),
             orchestrator,
             identity,
             machine_info,
@@ -56,6 +58,10 @@ impl ObservabilityService {
 
     pub fn take_cpu_config_json(&self) -> Option<String> {
         self.pending_cpu_config.lock().unwrap().take()
+    }
+
+    pub(crate) async fn flush_heartbeat(&self) -> Result<()> {
+        self.heartbeat.flush().await
     }
 
     pub fn store_cluster_cpu_config(&self, config: String) {

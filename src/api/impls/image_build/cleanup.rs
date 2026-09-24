@@ -18,6 +18,22 @@ impl ApiImpl {
                 warn!(key = %String::from_utf8_lossy(&key), error = %format_args!("{error:#}"), "build recovery failed; journal retained for retry");
             }
         }
+        // Results retain routing after workers exit. Recovery and deletion
+        // serialize so a concurrent scan cannot resurrect a deleted route.
+        {
+            let _routes = self.build_sessions.result_routes.lock().await;
+            for (key, _) in journal.scan_prefix(b"image/".to_vec()).await? {
+                let id = std::str::from_utf8(&key[6..])
+                    .context("invalid image result key")
+                    .and_then(|id| SandboxId::parse_str(id).map_err(Into::into));
+                match id {
+                    Ok(id) => self.orchestrator.register_template_build(id).await,
+                    Err(error) => {
+                        warn!(key = %String::from_utf8_lossy(&key), %error, "invalid image result routing identity")
+                    }
+                }
+            }
+        }
         self.collect_retired_build_caches().await?;
         Ok(())
     }
@@ -94,9 +110,14 @@ impl ApiImpl {
         self.release_builder(id, &entry.cache).await?;
         self.cleanup_build_cache(id, &entry).await?;
         persisted?;
-        self.orchestrator
-            .unregister_template_build(sandbox_id)
-            .await;
+        if entry.image_only {
+            self.snapshot_manager.delete(id).await?;
+        }
+        if journal.get(format!("image/{id}")).await?.is_none() {
+            self.orchestrator
+                .unregister_template_build(sandbox_id)
+                .await;
+        }
         journal.delete(key).await?;
         self.build_sessions.active.lock().unwrap().remove(id);
         Ok(())

@@ -102,6 +102,7 @@ impl ObservabilityReporter {
         let mut heartbeat_shutdown_rx = shutdown_rx.clone();
         let mut event_shutdown_rx = shutdown_rx;
         let mut sandbox_event_rx = event_service.subscribe_sandbox_events();
+        let mut heartbeat_requests = service.heartbeat.enable();
 
         let heartbeat_join = tokio::spawn(async move {
             let mut backoff = config.interval;
@@ -112,6 +113,7 @@ impl ObservabilityReporter {
                 if wait > Duration::ZERO {
                     tokio::select! {
                         _ = sleep(wait) => {}
+                        _ = heartbeat_requests.changed() => {}
                         changed = heartbeat_shutdown_rx.changed() => {
                             if changed.is_err() || *heartbeat_shutdown_rx.borrow() {
                                 info!("observability heartbeat reporter stopping");
@@ -121,6 +123,7 @@ impl ObservabilityReporter {
                     }
                 }
 
+                let generation = service.heartbeat.generation();
                 match Self::send_heartbeat(
                     &config,
                     &service,
@@ -131,6 +134,7 @@ impl ObservabilityReporter {
                 .await
                 {
                     Ok(()) => {
+                        service.heartbeat.complete(generation);
                         ever_heartbeat_succeeded.store(true, Ordering::Relaxed);
                         backoff = config.interval;
                         wait = config.interval;
@@ -279,7 +283,13 @@ impl ObservabilityReporter {
         snapshot.machine_info.cpu_config_json = cpu_config_json.clone();
         let node_id = snapshot.node_id.clone();
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let req = Self::build_heartbeat_request(snapshot, now_ms, p2p_endpoint);
+        let mut req = Self::build_heartbeat_request(snapshot, now_ms, p2p_endpoint);
+        req.local_images = crate::image::cache::ImageCacheService::shared_from_app_config(
+            crate::cfg::ConfigManager::global_config(),
+        )
+        .local_image_digests()
+        .await
+        .context("collect local image inventory")?;
 
         let mut request = Request::new(req);
         request.set_timeout(GRPC_CALL_TIMEOUT);
@@ -382,6 +392,7 @@ impl ObservabilityReporter {
         p2p_endpoint: Option<&P2pEndpoint>,
     ) -> scheduler::HeartbeatRequest {
         scheduler::HeartbeatRequest {
+            local_images: Vec::new(),
             node_id: snapshot.node_id,
             cluster_id: snapshot.cluster_id.to_string(),
             service_instance_id: snapshot.service_instance_id,

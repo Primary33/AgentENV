@@ -1,4 +1,8 @@
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::Args as ClapArgs;
@@ -16,39 +20,45 @@ use crate::client::{
 };
 use crate::progress::BuildProgress;
 
+use super::compose;
+
 #[derive(Clone, ClapArgs)]
 #[command(after_help = "\
 Examples:
   aenv build --name my-ubuntu .
   aenv build --name my-python ./my-python
   aenv build --name my-app -f ./my-app/Dockerfile.custom ./my-app
+  aenv build --compose compose.yaml
 ")]
 pub struct Args {
     /// Local build context directory
-    context: PathBuf,
+    #[arg(required_unless_present = "compose", conflicts_with = "compose")]
+    context: Option<PathBuf>,
     /// Dockerfile path (defaults to CONTEXT/Dockerfile)
-    #[arg(short = 'f', long = "file")]
+    #[arg(short = 'f', long = "file", conflicts_with = "compose")]
     dockerfile: Option<PathBuf>,
     /// Template name
-    #[arg(long)]
-    name: String,
+    #[arg(long, required_unless_present = "compose", conflicts_with = "compose")]
+    name: Option<String>,
+    #[command(flatten)]
+    pub(super) compose: compose::BuildArgs,
     #[command(flatten)]
     resources: super::CpuMemoryArgs,
     /// Override image ENTRYPOINT/CMD; an empty value disables startup
-    #[arg(long)]
+    #[arg(long, conflicts_with = "compose")]
     start_cmd: Option<String>,
     /// Override the image HEALTHCHECK with a command that must succeed before capture
-    #[arg(long)]
+    #[arg(long, conflicts_with = "compose")]
     ready_cmd: Option<String>,
     /// Build argument, KEY=VALUE; repeatable
-    #[arg(long = "build-arg")]
+    #[arg(long = "build-arg", conflicts_with = "compose")]
     build_args: Vec<String>,
     /// BuildKit secret, for example id=token,src=./token; repeatable
-    #[arg(long)]
+    #[arg(long, conflicts_with = "compose")]
     secret: Vec<String>,
     /// Rebuild without cached instructions or their cache mounts
     #[arg(long)]
-    no_cache: bool,
+    pub(super) no_cache: bool,
     /// Path to the local BuildKit client executable
     #[arg(long)]
     buildctl: Option<PathBuf>,
@@ -64,9 +74,10 @@ pub struct Args {
 #[cfg(target_os = "linux")]
 pub(super) fn codex_template(context: PathBuf, name: String) -> Result<()> {
     run(Args {
-        context,
+        context: Some(context),
         dockerfile: None,
-        name,
+        name: Some(name),
+        compose: compose::BuildArgs::default(),
         resources: super::CpuMemoryArgs {
             cpu_count: Some(2),
             memory_mb: Some(1024),
@@ -90,7 +101,6 @@ pub fn run(mut args: Args) -> Result<()> {
     if args.buildctl.is_none() {
         args.buildctl = Some(std::env::current_exe()?.with_file_name("aenv-buildctl"));
     }
-    let context = BuildContext::prepare(&args)?;
     let buildctl = args
         .buildctl
         .as_ref()
@@ -110,14 +120,55 @@ pub fn run(mut args: Args) -> Result<()> {
         "CPU and memory must be greater than zero"
     );
     let client = Client::from_env()?;
-    super::tokio_rt()?.block_on(run_async(client, args, context))
+    if args.compose.compose.is_some() {
+        return compose::run_build(client, args);
+    }
+    let build = Build {
+        name: args.name.clone().context("missing build name")?,
+        context: BuildContext::prepare(
+            args.context.as_deref().context("missing build context")?,
+            args.dockerfile.as_deref(),
+        )?,
+        build_args: args.build_args.clone(),
+        no_cache: args.no_cache,
+        image: None,
+    };
+    super::tokio_rt()?.block_on(run_async(&client, &args, &build, &[]))?;
+    Ok(())
 }
 
-async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<()> {
+pub(super) struct Build {
+    pub(super) name: String,
+    pub(super) context: BuildContext,
+    pub(super) build_args: Vec<String>,
+    pub(super) no_cache: bool,
+    pub(super) image: Option<ImageBuild>,
+}
+
+/// Compose image-only build: the server imports the image into the build
+/// node's local cache; `push` additionally distributes it through a registry.
+pub(super) struct ImageBuild {
+    pub(super) target: Option<String>,
+    pub(super) push: Option<ImagePush>,
+}
+
+pub(super) struct ImagePush {
+    pub(super) image: String,
+    pub(super) insecure: bool,
+}
+
+pub(super) async fn run_async(
+    client: &Client,
+    args: &Args,
+    input: &Build,
+    image_dependencies: &[String],
+) -> Result<BuildInfo> {
     let request = json!({
         "timeout": args.timeout,
         "startCmd": args.start_cmd,
         "readyCmd": args.ready_cmd,
+        "imageOnly": input.image.is_some(),
+        "imageDependencies": image_dependencies,
     });
     let mut session = None;
     let progress = BuildProgress::new(args.progress == "auto")?;
@@ -128,7 +179,7 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
                     Method::POST,
                     "/v3/templates",
                     Some(serde_json::to_value(CreateTemplateV3 {
-                        name: args.name.clone(),
+                        name: input.name.clone(),
                         tags: vec![],
                         cpu_count: args.resources.cpu_count,
                         memory_mb: args.resources.memory_mb,
@@ -136,10 +187,14 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
                 )
                 .await?,
         )?;
-        println!(
-            "Created template {} (build {})",
-            allocated.template_id, allocated.build_id
-        );
+        if input.image.is_some() {
+            eprintln!("Allocated image build {}", allocated.build_id);
+        } else {
+            println!(
+                "Created template {} (build {})",
+                allocated.template_id, allocated.build_id
+            );
+        }
         let allocated = session.insert(allocated);
         progress.stage(0, "Preparing template builder");
         let builder: Builder = serde_json::from_slice(
@@ -147,55 +202,57 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
                 .build_request(Method::PUT, &builder_path(allocated), Some(request))
                 .await?,
         )?;
-        build(
-            &client,
-            allocated,
-            &args,
-            &context,
-            &progress,
-            &builder.image_name,
-        )
-        .await
+        if input.image.is_some() {
+            ensure!(
+                builder.image_only,
+                "server does not support image-only builds; upgrade the AgentENV server"
+            );
+        }
+        build(client, allocated, args, input, &progress, &builder).await
     };
     let result = tokio::select! {
         biased;
         signal = interrupted() => signal.and_then(|()| Err(anyhow::anyhow!("build interrupted"))),
-        result = tokio::time::timeout(Duration::from_secs(u64::from(args.timeout) + 600), operation) => result.context("build deadline exceeded").and_then(|r| r),
+        result = tokio::time::timeout(Duration::from_secs(u64::from(args.timeout) + 600), operation) => result.context("build deadline exceeded; if the build finished without the server reporting it ready, upgrade the AgentENV server").and_then(|r| r),
     };
     if result.is_ok() {
         progress.finish();
     }
     drop(progress);
-    if let Err(error) = result {
-        if let Some(session) = session {
-            let path = builder_path(&session);
-            let cleanup = tokio::time::timeout(
-                Duration::from_secs(5),
-                client.build_request(Method::DELETE, &path, None),
-            )
-            .await
-            .context("cleanup request timed out")
-            .and_then(|result| result);
-            if let Err(cleanup) = cleanup {
-                eprintln!(
-                    "Build cleanup: {cleanup:#}. Check build {} with `aenv template watch`.",
-                    session.build_id
-                );
-            }
+    if result.is_err() || input.image.is_some() {
+        if let Some(session) = &session {
+            delete_builder(client, session).await;
         }
-        return Err(error);
     }
-    println!(
-        "Template {} is ready.",
-        session.context("missing build session")?.template_id
-    );
-    Ok(())
+    let built = result?;
+    if let Some(image) = &input.image {
+        match &image.push {
+            Some(push) => eprintln!("Image {} is ready.", push.image),
+            None => eprintln!("Image is ready."),
+        }
+    } else {
+        println!(
+            "Template {} is ready.",
+            session.context("missing build session")?.template_id
+        );
+    }
+    Ok(built)
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct BuildInfo {
+    #[serde(flatten)]
+    template: TemplateBuildInfo,
+    #[serde(default, rename = "imageDigest")]
+    pub(super) image_digest: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct Builder {
     #[serde(rename = "imageName")]
     image_name: String,
+    #[serde(default, rename = "imageOnly")]
+    image_only: bool,
 }
 
 fn builder_path(session: &TemplateV3Response) -> String {
@@ -205,30 +262,51 @@ fn builder_path(session: &TemplateV3Response) -> String {
     )
 }
 
+/// Best-effort builder release; the server keeps image build records until
+/// this DELETE, so failure only leaves a stale record behind.
+async fn delete_builder(client: &Client, session: &TemplateV3Response) {
+    let path = builder_path(session);
+    let cleanup = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.build_request(Method::DELETE, &path, None),
+    )
+    .await
+    .context("cleanup request timed out")
+    .and_then(|result| result);
+    if let Err(cleanup) = cleanup {
+        eprintln!(
+            "Build cleanup: {cleanup:#}. Check build {} with `aenv template watch`.",
+            session.build_id
+        );
+    }
+}
+
 async fn wait_for_status(
     client: &Client,
     session: &TemplateV3Response,
     expected: &str,
-) -> Result<()> {
+) -> Result<BuildInfo> {
     loop {
         let path = format!(
             "/templates/{}/builds/{}/status",
             session.template_id, session.build_id
         );
-        let status: TemplateBuildInfo =
+        let status: BuildInfo =
             serde_json::from_slice(&client.build_request(Method::GET, &path, None).await?)?;
         ensure!(
-            status.template_id == session.template_id && status.build_id == session.build_id,
+            status.template.template_id == session.template_id
+                && status.template.build_id == session.build_id,
             "build status response ID mismatch"
         );
-        if status.status == expected {
-            return Ok(());
+        if status.template.status == expected {
+            return Ok(status);
         }
-        match status.status.as_str() {
+        match status.template.status.as_str() {
             "waiting" | "building" => tokio::time::sleep(Duration::from_secs(1)).await,
             "error" => bail!(
                 "template build failed: {}",
                 status
+                    .template
                     .reason
                     .map_or_else(|| "unknown error".into(), |r| r.message)
             ),
@@ -252,11 +330,12 @@ async fn build(
     client: &Client,
     session: &TemplateV3Response,
     args: &Args,
-    context: &BuildContext,
+    input: &Build,
     progress: &BuildProgress,
-    image_name: &str,
-) -> Result<()> {
+    builder: &Builder,
+) -> Result<BuildInfo> {
     let path = builder_path(session);
+    let context = &input.context;
     wait_for_status(client, session, "building").await?;
     progress.stage(1, "Building image");
     let (_work, listener, address) = buildkit::bind_local().await?;
@@ -287,16 +366,36 @@ async fn build(
             .arg("--opt")
             .arg(format!("filename={}", context.filename))
             .arg("--output")
-            .arg(format!("type=image,name={image_name},oci-mediatypes=true"))
+            .arg(format!(
+                "type=image,name={},oci-mediatypes=true",
+                builder.image_name
+            ))
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        for arg in &args.build_args {
+        if let Some(image) = &input.image {
+            if let Some(push) = &image.push {
+                command.arg("--output").arg(format!(
+                    "type=image,name={},push=true,oci-mediatypes=true{}",
+                    push.image,
+                    if push.insecure {
+                        ",registry.insecure=true"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            command.args(["--opt", "platform=linux/amd64"]);
+            if let Some(target) = &image.target {
+                command.arg("--opt").arg(format!("target={target}"));
+            }
+        }
+        for arg in &input.build_args {
             command.arg("--opt").arg(format!("build-arg:{arg}"));
         }
         for secret in &args.secret {
             command.arg("--secret").arg(secret);
         }
-        if args.no_cache {
+        if input.no_cache {
             command.arg("--no-cache");
         }
         if progress.visible() {
@@ -317,29 +416,32 @@ async fn build(
         result = command => result?,
         result = client.buildkit_tunnel(&path, listener) => { result?; bail!("BuildKit tunnel closed"); }
     }
-    progress.stage(2, "Converting image and publishing template");
+    progress.stage(
+        2,
+        if input.image.is_some() {
+            "Importing image into the node cache"
+        } else {
+            "Converting image and publishing template"
+        },
+    );
     wait_for_status(client, session, "ready").await
 }
 
-struct BuildContext {
+pub(super) struct BuildContext {
     context: PathBuf,
     dockerfile_dir: PathBuf,
     filename: String,
 }
 
 impl BuildContext {
-    fn prepare(args: &Args) -> Result<Self> {
-        let context = args
-            .context
-            .canonicalize()
-            .context("locate build context")?;
+    pub(super) fn prepare(context: &Path, dockerfile: Option<&Path>) -> Result<Self> {
+        let context = context.canonicalize().context("locate build context")?;
         ensure!(
             context.is_dir(),
             "build context must be a directory; use -f <Dockerfile> to select a Dockerfile"
         );
-        let file = args
-            .dockerfile
-            .clone()
+        let file = dockerfile
+            .map(Path::to_owned)
             .unwrap_or_else(|| context.join("Dockerfile"))
             .canonicalize()
             .context("locate Dockerfile")?;
@@ -375,6 +477,62 @@ mod tests {
         args: Args,
     }
 
+    #[tokio::test]
+    async fn completed_image_status_and_cleanup_use_build_identity() -> Result<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let client = Client::new(&format!("http://{}", listener.local_addr()?), "test-key")?;
+        let server = tokio::spawn(async move {
+            for (method, suffix, status, body) in [
+                (
+                    "GET",
+                    "status",
+                    "200 OK",
+                    r#"{"templateID":"build-1","buildID":"build-1","status":"ready"}"#,
+                ),
+                ("DELETE", "builder", "204 No Content", ""),
+            ] {
+                let (stream, _) = listener.accept().await?;
+                let mut stream = tokio::io::BufReader::new(stream);
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    ensure!(stream.read_line(&mut line).await? != 0, "unexpected EOF");
+                    if line == "\r\n" {
+                        break;
+                    }
+                    headers.push_str(&line);
+                }
+                assert!(headers.starts_with(&format!(
+                    "{method} /templates/build-1/builds/build-1/{suffix} HTTP/1.1\r\n"
+                )));
+                assert!(!headers
+                    .to_ascii_lowercase()
+                    .contains("x-agentenv-required-node"));
+                stream
+                    .get_mut()
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let session = TemplateV3Response {
+            template_id: "build-1".into(),
+            build_id: "build-1".into(),
+        };
+        let info = wait_for_status(&client, &session, "ready").await?;
+        assert_eq!(info.template.build_id, "build-1");
+        delete_builder(&client, &session).await;
+        server.await??;
+        Ok(())
+    }
+
     #[test]
     fn command_uses_docker_context_and_file_arguments() {
         Cli::command().debug_assert();
@@ -396,7 +554,7 @@ mod tests {
         .args;
         assert_eq!(args.resources.cpu_count, Some(2));
         assert_eq!(args.build_args, ["VALUE=a b"]);
-        assert_eq!(args.context, PathBuf::from("."));
+        assert_eq!(args.context, Some(PathBuf::from(".")));
         assert_eq!(
             args.dockerfile,
             Some("deploy/docker/Dockerfile.agentenv".into())
@@ -457,20 +615,25 @@ mod tests {
         std::fs::write(context.join("Dockerfile"), "FROM scratch\n")?;
         let mut args =
             Cli::try_parse_from(["aenv", context.to_str().unwrap(), "--name", "demo"])?.args;
-        let prepared = BuildContext::prepare(&args)?;
+        let prepared =
+            BuildContext::prepare(args.context.as_deref().unwrap(), args.dockerfile.as_deref())?;
         assert_eq!(prepared.context, context.canonicalize()?);
         assert_eq!(prepared.dockerfile_dir, prepared.context);
         args.dockerfile = Some(custom.clone());
-        let prepared = BuildContext::prepare(&args)?;
+        let prepared =
+            BuildContext::prepare(args.context.as_deref().unwrap(), args.dockerfile.as_deref())?;
         assert_eq!(prepared.context, context.canonicalize()?);
         assert_eq!(prepared.dockerfile_dir, dockerfiles.canonicalize()?);
         assert_eq!(prepared.filename, "Custom.Dockerfile");
-        args.context = custom;
-        assert!(BuildContext::prepare(&args)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("use -f"));
+        args.context = Some(custom);
+        assert!(BuildContext::prepare(
+            args.context.as_deref().unwrap(),
+            args.dockerfile.as_deref()
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("use -f"));
         Ok(())
     }
 }

@@ -23,7 +23,10 @@ pub(crate) use transport::router;
 use super::ApiImpl;
 use crate::{
     cfg::ConfigManager,
-    image::buildkit::{build_image_name, BuildkitContent},
+    image::{
+        buildkit::{build_image_name, BuildkitContent},
+        ResolvedBlockImage,
+    },
     local_store::{LocalKvStore, LocalStoreDurability},
     snapshot::{
         CommandContext, RunnableSnapshot, SnapshotId, SnapshotRecord, TemplateBuildErrorReason,
@@ -36,6 +39,7 @@ use crate::{
 pub(crate) struct BuildSessions {
     active: StdMutex<HashMap<String, BuildSession>>,
     journal: OnceCell<LocalKvStore>,
+    result_routes: Mutex<()>,
     builder_template: OnceCell<RunnableSnapshot>,
 }
 
@@ -85,6 +89,8 @@ impl BuildSessions {
 struct BuildJournal {
     cache: String,
     parent: Option<String>,
+    #[serde(default)]
+    image_only: bool,
 }
 
 impl BuildJournal {
@@ -196,6 +202,22 @@ impl ApiImpl {
         }
         let id = SnapshotId::parse(build_id)
             .map_err(|_| Self::error(404, "template build not found"))?;
+        if let Some(dependencies) = &body.image_dependencies {
+            if dependencies.len() > 24 {
+                return Err(Self::error(
+                    400,
+                    "at most 24 image dependencies are supported",
+                ));
+            }
+            for digest in dependencies {
+                crate::image::buildkit::validate_digest(digest)
+                    .map_err(|error| Self::error(400, error.to_string()))?;
+                self.image_resolver
+                    .resolve_local(digest)
+                    .await
+                    .map_err(|error| Self::error(400, error.to_string()))?;
+            }
+        }
         // Reserve synchronously before spawning or touching durable state. Failed starts
         // release the slot; admitted builds hold it through publication and cleanup.
         let session = self.build_sessions.reserve(&id.to_string())?;
@@ -271,6 +293,7 @@ impl ApiImpl {
         let entry = BuildJournal {
             cache: format!("aenv-buildkit-work-{id}"),
             parent: None,
+            image_only: body.image_only.unwrap_or(false),
         };
         if let Err(err) = entry.persist(journal, &id.to_string()).await {
             let _ = self
@@ -288,12 +311,13 @@ impl ApiImpl {
             )
             .await;
         let api = self.clone();
+        let image_only = entry.image_only;
         tokio::spawn(async move {
             api.run_image_build(record, body, session, entry).await;
         });
-        Ok(models::TemplateBuilder::new(build_image_name(
-            &id.to_string(),
-        )))
+        let mut builder = models::TemplateBuilder::new(build_image_name(&id.to_string()));
+        builder.image_only = Some(image_only);
+        Ok(builder)
     }
 
     fn session(&self, template_id: &str, build_id: &str) -> Result<BuildSession, models::Error> {
@@ -320,15 +344,22 @@ impl ApiImpl {
         let session = match self.session(template_id, build_id) {
             Ok(session) => session,
             Err(_) => {
-                self.snapshot_manager
-                    .get(build_id)
+                if self
+                    .image_build_info(build_id)
                     .await
-                    .map_err(|err| Self::snapshot_manager_error(&err))?
-                    .ok_or_else(|| Self::error(404, "template build not found"))?;
-                return self
-                    .retry_image_build_cleanup(build_id)
+                    .map_err(|err| Self::internal_error(err.as_ref()))?
+                    .is_none()
+                {
+                    self.snapshot_manager
+                        .get(build_id)
+                        .await
+                        .map_err(|err| Self::snapshot_manager_error(&err))?
+                        .ok_or_else(|| Self::error(404, "template build not found"))?;
+                }
+                self.retry_image_build_cleanup(build_id)
                     .await
-                    .map_err(|err| Self::error(500, format!("builder cleanup failed: {err:#}")));
+                    .map_err(|err| Self::error(500, format!("builder cleanup failed: {err:#}")))?;
+                return self.delete_image_build_result(build_id).await;
             }
         };
         let mut state = session.state.subscribe();
@@ -348,7 +379,49 @@ impl ApiImpl {
                 500,
                 "builder cleanup is still running; retry cancellation later",
             )
-        })?
+        })??;
+        self.delete_image_build_result(build_id).await
+    }
+
+    // Results outlive worker cleanup and server restarts, without occupying a
+    // build slot or making a node-local image look like a committed snapshot.
+    pub(super) async fn image_build_info(
+        &self,
+        id: &str,
+    ) -> Result<Option<models::TemplateBuildInfo>> {
+        let Some(digest) = self
+            .build_journal()
+            .await?
+            .get(format!("image/{id}"))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut info = models::TemplateBuildInfo::new(
+            Vec::new(),
+            Vec::new(),
+            id.to_owned(),
+            id.to_owned(),
+            models::TemplateBuildStatus::Ready,
+        );
+        info.image_digest = Some(String::from_utf8(digest)?);
+        Ok(Some(info))
+    }
+
+    async fn delete_image_build_result(&self, id: &str) -> Result<(), models::Error> {
+        let _routes = self.build_sessions.result_routes.lock().await;
+        self.build_journal()
+            .await
+            .map_err(|err| Self::internal_error(err.as_ref()))?
+            .delete(format!("image/{id}"))
+            .await
+            .map_err(|err| Self::internal_error(err.as_ref()))?;
+        self.orchestrator
+            .unregister_template_build(
+                SandboxId::parse_str(id).map_err(|_| Self::error(404, "invalid build ID"))?,
+            )
+            .await;
+        Ok(())
     }
 
     #[tracing::instrument(skip_all, fields(build_id = %record.id))]
@@ -370,47 +443,56 @@ impl ApiImpl {
             let (address, digest) = self
                 .wait_for_image_build(&record, &body, &session, &entry, deadline, &logger)
                 .await?;
-            let content = BuildkitContent::connect(address).await?;
-            let resolved = tokio::time::timeout(
-                Duration::from_secs(3600),
-                self.image_resolver.resolve_buildkit(&content, &digest),
-            )
-            .await
-            .context("image import deadline exceeded")??;
+            let resolved = self.import_build_image(address, &digest).await?;
+            if entry.image_only {
+                if let Some(observability) = &self.observability {
+                    observability.flush_heartbeat().await?;
+                }
+                self.build_journal()
+                    .await?
+                    .put(format!("image/{id}"), resolved.image_ref.as_bytes())
+                    .await?;
+            }
             // Let buildctl receive its final Solve response before stopping BuildKit.
             // A client that keeps sockets open must not indefinitely delay publication.
             let _connections =
                 tokio::time::timeout(Duration::from_secs(10), session.connections.write()).await;
             let cache_ready = self.release_builder(&id, &entry.cache).await?;
-            let context = CommandContext::from(resolved.base_context);
-            let (start, ready) =
-                build_startup_commands(&body, &context, resolved.raw_config.as_ref())?;
-            let mut configs = ImageConfigs::new();
-            if let Some(config) = resolved.raw_config {
-                configs.add(None::<String>, "/", config);
+            if !entry.image_only {
+                let context = CommandContext::from(resolved.base_context);
+                let (start, ready) =
+                    build_startup_commands(&body, &context, resolved.raw_config.as_ref())?;
+                let mut configs = ImageConfigs::new();
+                if let Some(config) = resolved.raw_config {
+                    configs.add(None::<String>, "/", config);
+                }
+                let mut spec = TemplateBuildSpec::new()
+                    .with_logger(logger.clone())
+                    .alias(
+                        record
+                            .alias
+                            .as_ref()
+                            .context("template name missing")?
+                            .to_string(),
+                    )
+                    .resources(record.resources.cpu_count, record.resources.memory_mib)
+                    .with_startup_shell("/bin/sh")
+                    .with_resolved_overlaybd_image(resolved.overlaybd_config_path, configs)
+                    .with_base_context(context);
+                if let Some(start) = start {
+                    spec = spec.start_cmd(start);
+                }
+                if let Some(ready) = ready {
+                    spec = spec.ready_cmd(ready);
+                }
+                self.template_builder
+                    .build_and_publish_with_id(
+                        self.snapshot_manager.as_ref(),
+                        record.id.clone(),
+                        spec,
+                    )
+                    .await?;
             }
-            let mut spec = TemplateBuildSpec::new()
-                .with_logger(logger.clone())
-                .alias(
-                    record
-                        .alias
-                        .as_ref()
-                        .context("template name missing")?
-                        .to_string(),
-                )
-                .resources(record.resources.cpu_count, record.resources.memory_mib)
-                .with_startup_shell("/bin/sh")
-                .with_resolved_overlaybd_image(resolved.overlaybd_config_path, configs)
-                .with_base_context(context);
-            if let Some(start) = start {
-                spec = spec.start_cmd(start);
-            }
-            if let Some(ready) = ready {
-                spec = spec.ready_cmd(ready);
-            }
-            self.template_builder
-                .build_and_publish_with_id(self.snapshot_manager.as_ref(), record.id.clone(), spec)
-                .await?;
             if cache_ready {
                 if let Err(error) = self.publish_build_cache(&id, &entry.cache).await {
                     warn!(build_id = %id, error = %format_args!("{error:#}"), "cache publication failed; keeping the previous cache seed");
@@ -420,6 +502,20 @@ impl ApiImpl {
         };
         self.supervise_image_build(&record, &session, logs, work)
             .await;
+    }
+
+    async fn import_build_image(
+        &self,
+        address: SocketAddr,
+        digest: &str,
+    ) -> Result<ResolvedBlockImage> {
+        let content = BuildkitContent::connect(address).await?;
+        tokio::time::timeout(
+            Duration::from_secs(3600),
+            self.image_resolver.resolve_buildkit(&content, digest),
+        )
+        .await
+        .context("image import deadline exceeded")?
     }
 
     async fn supervise_image_build(
@@ -433,16 +529,14 @@ impl ApiImpl {
             .catch_unwind()
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("build worker panicked")));
-        self.finish_image_build(record, session, result).await;
-        if let Err(error) = logs.finish().await {
-            warn!(build_id = %record.id, %error, "failed to persist final build logs");
-        }
+        self.finish_image_build(record, session, logs, result).await;
     }
 
     async fn finish_image_build(
         &self,
         record: &SnapshotRecord,
         session: &BuildSession,
+        logs: BuildLogSession,
         result: Result<()>,
     ) {
         let id = record.id.to_string();
@@ -456,6 +550,16 @@ impl ApiImpl {
                 Some(TemplateBuildErrorReason::new(format!("{error:#}")))
             }
         };
+        if reason.is_some() {
+            // Failed exporters still have a final Solve error to deliver. Give
+            // buildctl a bounded chance to print it before closing its tunnel.
+            let _connections =
+                tokio::time::timeout(Duration::from_secs(10), session.connections.write()).await;
+        }
+        // Finish the writer before cleanup deletes image-only drafts and their logs.
+        if let Err(error) = logs.finish().await {
+            warn!(build_id = %id, %error, "failed to persist final build logs");
+        }
         session.state.send_replace(SessionState::Finished(reason));
         if let Err(error) = self.retry_image_build_cleanup(&id).await {
             warn!(build_id = %id, error = %format_args!("{error:#}"), "build finalization failed; cleanup will be retried");

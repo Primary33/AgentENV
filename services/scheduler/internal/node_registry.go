@@ -26,6 +26,7 @@ type NodeRegistry interface {
 	// and returns only the raw snapshot suitable for scheduling decisions.
 	// Returns nil if the node has never sent a heartbeat.
 	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
+	HasLocalImages(nodeID string, digests []string, now time.Time) bool
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
 }
 
@@ -36,6 +37,7 @@ var (
 )
 
 type observedNodeRecord struct {
+	localImages map[string]struct{}
 	node        *schedulerv1.ObservedNode
 	p2pEndpoint *schedulerv1.P2PEndpoint
 	reportTTL   time.Duration
@@ -159,6 +161,7 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 	}
 
 	record := observedNodeRecord{
+		localImages: make(map[string]struct{}, len(req.GetLocalImages())),
 		node: &schedulerv1.ObservedNode{
 			NodeId:            req.GetNodeId(),
 			Endpoint:          node.Endpoint,
@@ -172,6 +175,9 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 		},
 		p2pEndpoint: cloneP2PEndpoint(req.GetP2PEndpoint()),
 		reportTTL:   r.observedTTL,
+	}
+	for _, digest := range req.GetLocalImages() {
+		record.localImages[digest] = struct{}{}
 	}
 	if record.node.Snapshot.GetReportedAtUnixMs() == 0 {
 		record.node.Snapshot.ReportedAtUnixMs = nowMs

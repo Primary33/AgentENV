@@ -207,9 +207,11 @@ type ScheduleRequestHint struct {
 	//
 	//	*ScheduleRequestHint_NewColdSandbox
 	//	*ScheduleRequestHint_NewSandbox
-	Kind          isScheduleRequestHint_Kind `protobuf_oneof:"kind"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Kind isScheduleRequestHint_Kind `protobuf_oneof:"kind"`
+	// Local image dependencies. Placement must have every digest in its cache.
+	RequiredImages []string `protobuf:"bytes,3,rep,name=required_images,json=requiredImages,proto3" json:"required_images,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ScheduleRequestHint) Reset() {
@@ -263,6 +265,13 @@ func (x *ScheduleRequestHint) GetNewSandbox() *NewSandboxHint {
 		if x, ok := x.Kind.(*ScheduleRequestHint_NewSandbox); ok {
 			return x.NewSandbox
 		}
+	}
+	return nil
+}
+
+func (x *ScheduleRequestHint) GetRequiredImages() []string {
+	if x != nil {
+		return x.RequiredImages
 	}
 	return nil
 }
@@ -1238,8 +1247,10 @@ type HeartbeatRequest struct {
 	Snapshot          *NodeSnapshot          `protobuf:"bytes,7,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
 	SandboxIds        []string               `protobuf:"bytes,8,rep,name=sandbox_ids,json=sandboxIds,proto3" json:"sandbox_ids,omitempty"`
 	P2PEndpoint       *P2PEndpoint           `protobuf:"bytes,9,opt,name=p2p_endpoint,json=p2pEndpoint,proto3" json:"p2p_endpoint,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Complete inventory of usable, unscoped local image manifest digests.
+	LocalImages   []string `protobuf:"bytes,10,rep,name=local_images,json=localImages,proto3" json:"local_images,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HeartbeatRequest) Reset() {
@@ -1331,6 +1342,13 @@ func (x *HeartbeatRequest) GetSandboxIds() []string {
 func (x *HeartbeatRequest) GetP2PEndpoint() *P2PEndpoint {
 	if x != nil {
 		return x.P2PEndpoint
+	}
+	return nil
+}
+
+func (x *HeartbeatRequest) GetLocalImages() []string {
+	if x != nil {
+		return x.LocalImages
 	}
 	return nil
 }
@@ -2314,11 +2332,12 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x19api/proto/scheduler.proto\x12\fscheduler.v1\";\n" +
 	"\x04Node\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1a\n" +
-	"\bendpoint\x18\x02 \x01(\tR\bendpoint\"\xac\x01\n" +
+	"\bendpoint\x18\x02 \x01(\tR\bendpoint\"\xd5\x01\n" +
 	"\x13ScheduleRequestHint\x12L\n" +
 	"\x10new_cold_sandbox\x18\x01 \x01(\v2 .scheduler.v1.NewColdSandboxHintH\x00R\x0enewColdSandbox\x12?\n" +
 	"\vnew_sandbox\x18\x02 \x01(\v2\x1c.scheduler.v1.NewSandboxHintH\x00R\n" +
-	"newSandboxB\x06\n" +
+	"newSandbox\x12'\n" +
+	"\x0frequired_images\x18\x03 \x03(\tR\x0erequiredImagesB\x06\n" +
 	"\x04kind\"\xef\x01\n" +
 	"\x12NewColdSandboxHint\x12\x1b\n" +
 	"\tcpu_count\x18\x01 \x01(\rR\bcpuCount\x12\x1b\n" +
@@ -2399,7 +2418,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x06commit\x18\x06 \x01(\tR\x06commit\x12<\n" +
 	"\fmachine_info\x18\a \x01(\v2\x19.scheduler.v1.MachineInfoR\vmachineInfo\x126\n" +
 	"\bsnapshot\x18\b \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12)\n" +
-	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\"\x81\x03\n" +
+	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\"\xa4\x03\n" +
 	"\x10HeartbeatRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +
@@ -2411,7 +2430,9 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\bsnapshot\x18\a \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12\x1f\n" +
 	"\vsandbox_ids\x18\b \x03(\tR\n" +
 	"sandboxIds\x12<\n" +
-	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\";\n" +
+	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\x12!\n" +
+	"\flocal_images\x18\n" +
+	" \x03(\tR\vlocalImages\";\n" +
 	"\x11HeartbeatResponse\x12&\n" +
 	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\"\xf9\x01\n" +
 	"\fSandboxEvent\x12\x1d\n" +

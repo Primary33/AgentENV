@@ -10,6 +10,7 @@
 //! read an already-projected view of node state without rescanning all
 //! sandboxes on every call.
 
+mod heartbeat;
 mod host;
 mod machine;
 mod model;

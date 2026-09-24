@@ -1,5 +1,6 @@
 mod gc;
 mod graph;
+mod inventory;
 mod service;
 mod source_config;
 mod store;

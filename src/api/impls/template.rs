@@ -295,15 +295,22 @@ impl From<BuildLogEntry> for models::BuildLogEntry {
 }
 
 impl ApiImpl {
-    pub(super) async fn build_record(
+    pub(super) async fn build_info(
         &self,
         template: &str,
         build: &str,
-    ) -> Result<SnapshotRecord, models::Error> {
+    ) -> Result<(SnapshotId, models::TemplateBuildInfo), models::Error> {
         if template != build {
             return Err(Self::error(404, "build not found for template"));
         }
-        SnapshotId::parse(build).map_err(|_| Self::error(400, "invalid buildID"))?;
+        let id = SnapshotId::parse(build).map_err(|_| Self::error(400, "invalid buildID"))?;
+        if let Some(info) = self
+            .image_build_info(build)
+            .await
+            .map_err(|error| Self::internal_error(error.as_ref()))?
+        {
+            return Ok((id, info));
+        }
         let record = self
             .snapshot_manager
             .get(build)
@@ -313,7 +320,7 @@ impl ApiImpl {
         if !matches!(record.source, SnapshotSource::Template { .. }) {
             return Err(Self::error(404, "template build not found"));
         }
-        Ok(record)
+        Ok((id, record.into()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -594,12 +601,10 @@ impl Templates<()> for ApiImpl {
         query_params: &models::TemplatesTemplateIdBuildsBuildIdStatusGetQueryParams,
     ) -> Result<TemplatesTemplateIdBuildsBuildIdStatusGetResponse, ()> {
         match self
-            .build_record(&path_params.template_id, &path_params.build_id)
+            .build_info(&path_params.template_id, &path_params.build_id)
             .await
         {
-            Ok(record) => {
-                let id = record.id.clone();
-                let mut info = models::TemplateBuildInfo::from(record);
+            Ok((id, mut info)) => {
                 info.log_entries = match self
                     .query_build_logs(
                         &id,
@@ -671,8 +676,8 @@ impl Templates<()> for ApiImpl {
     ) -> Result<TemplatesTemplateIdBuildsBuildIdLogsGetResponse, ()> {
         use TemplatesTemplateIdBuildsBuildIdLogsGetResponse as Response;
         let result = async {
-            let record = self
-                .build_record(&path_params.template_id, &path_params.build_id)
+            let (id, _) = self
+                .build_info(&path_params.template_id, &path_params.build_id)
                 .await?;
             let cursor = query_params
                 .cursor
@@ -680,7 +685,7 @@ impl Templates<()> for ApiImpl {
                 .transpose()
                 .map_err(|_| Self::error(400, "cursor exceeds int64 range"))?;
             self.query_build_logs(
-                &record.id,
+                &id,
                 0,
                 cursor,
                 query_params.limit.unwrap_or(100) as usize,
