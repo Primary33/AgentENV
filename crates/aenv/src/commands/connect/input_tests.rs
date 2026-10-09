@@ -6,7 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc as channel, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
-const REQUEST_WAIT: Duration = Duration::from_secs(2);
+const REQUEST_WAIT: Duration = SEND_INPUT_TIMEOUT.saturating_mul(4);
 const TEST_SANDBOX_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
 
 #[derive(Clone, Copy)]
@@ -69,6 +69,17 @@ impl RpcFixture {
             .await
             .ok()
             .flatten()
+    }
+
+    async fn expect_input(&mut self, expected: &[u8], phase: &str) -> Result<InputRequest> {
+        let request = tokio::time::timeout(REQUEST_WAIT, self.requests.recv())
+            .await
+            .with_context(|| format!("timed out waiting for {phase} payload {expected:?}"))?
+            .with_context(|| {
+                format!("request channel closed while waiting for {phase} payload {expected:?}")
+            })?;
+        assert_eq!(request.payload, expected, "unexpected {phase} payload");
+        Ok(request)
     }
 
     async fn finish(mut self) -> Result<()> {
@@ -203,9 +214,8 @@ async fn check_recovery_input(
 
     stdin_tx.unbounded_send(first_payload.to_vec())?;
     let mut first = fixture
-        .next()
-        .await
-        .context("first recovery input did not arrive")?;
+        .expect_input(first_payload, "first recovery input")
+        .await?;
     let mut received = vec![first.payload.clone()];
     for payload in queued_payloads {
         stdin_tx.unbounded_send(payload.to_vec())?;
@@ -214,18 +224,19 @@ async fn check_recovery_input(
         first.respond(reply);
     }
 
-    for _ in 0..2 {
-        let Some(mut request) = fixture.next().await else {
-            break;
-        };
+    for (index, payload) in queued_payloads.into_iter().enumerate() {
+        let mut request = fixture
+            .expect_input(payload, &format!("queued recovery input {}", index + 1))
+            .await?;
         received.push(request.payload.clone());
         request.respond(Reply::Success);
     }
     stdin_tx.unbounded_send(b"fresh\n".to_vec())?;
-    if let Some(mut request) = fixture.next().await {
-        received.push(request.payload.clone());
-        request.respond(Reply::Success);
-    }
+    let mut fresh = fixture
+        .expect_input(b"fresh\n", "fresh recovery input")
+        .await?;
+    received.push(fresh.payload.clone());
+    fresh.respond(Reply::Success);
     drop(first);
     session.finish().await?;
     let extra = fixture.next().await.map(|request| request.payload);
