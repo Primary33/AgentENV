@@ -320,7 +320,6 @@ async fn maintain_stream_input(
                             &transport,
                             selector.clone(),
                             payload,
-                            &mut stdin_rx,
                         ).await;
                     }
                     _ = tokio::time::sleep(INPUT_STATE_POLL_INTERVAL) => {}
@@ -363,7 +362,6 @@ async fn maintain_stream_input(
                             &transport,
                             selector.clone(),
                             payload,
-                            &mut stdin_rx,
                         ).await;
                         break;
                     }
@@ -395,20 +393,13 @@ fn should_expect_output(payload: &[u8]) -> bool {
         .any(|byte| matches!(*byte, 0x20..=0x7e) || *byte >= 0x80)
 }
 
-async fn send_recovery_input(
-    transport: &Transport,
-    selector: ProcessSelector,
-    payload: Vec<u8>,
-    stdin_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
-) {
+async fn send_recovery_input(transport: &Transport, selector: ProcessSelector, payload: Vec<u8>) {
     let req = send_input_request(selector, payload);
     let _ = tokio::time::timeout(
         SEND_INPUT_TIMEOUT,
         transport.unary::<_, envd::process::SendInputResponse>("SendInput", req),
     )
     .await;
-
-    while stdin_rx.try_recv().is_ok() {}
 }
 
 async fn route_input(
@@ -835,6 +826,9 @@ enum ProbeStatus {
     Healthy,
     Unhealthy,
 }
+
+#[cfg(test)]
+mod input_tests;
 
 #[cfg(test)]
 mod tests {
