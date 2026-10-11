@@ -554,6 +554,8 @@ func requestTimeoutFor(r *http.Request, configured time.Duration) time.Duration 
 		switch strings.TrimRight(r.URL.Path, "/") {
 		case "/sandboxes-compose":
 			return max(configured, 330*time.Second)
+		case "/sandboxes-compose/plan":
+			return max(configured, 60*time.Second)
 		}
 	}
 	return configured

@@ -1209,6 +1209,195 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<BuildStatusR
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ComposeBuildRequest {
+    /// Compose YAML or JSON to validate and normalize for image builds. Files are read only by the client.
+    #[serde(rename = "compose")]
+    #[validate(length(min = 1, max = 1048576), custom(function = "check_xss_string"))]
+    pub compose: String,
+
+    #[serde(rename = "composeEnv")]
+    #[validate(custom(function = "check_xss_map_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_env: Option<std::collections::HashMap<String, String>>,
+
+    #[serde(rename = "profiles")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profiles: Option<Vec<String>>,
+
+    /// Apply Harbor task defaults before validation.
+    #[serde(rename = "harbor")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harbor: Option<bool>,
+}
+
+impl ComposeBuildRequest {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(compose: String) -> ComposeBuildRequest {
+        ComposeBuildRequest {
+            compose,
+            compose_env: None,
+            profiles: None,
+            harbor: Some(false),
+        }
+    }
+}
+
+/// Converts the ComposeBuildRequest value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ComposeBuildRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("compose".to_string()),
+            Some(self.compose.to_string()),
+            // Skipping composeEnv in query parameter serialization
+            self.profiles.as_ref().map(|profiles| {
+                [
+                    "profiles".to_string(),
+                    profiles
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ]
+                .join(",")
+            }),
+            self.harbor
+                .as_ref()
+                .map(|harbor| ["harbor".to_string(), harbor.to_string()].join(",")),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ComposeBuildRequest value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ComposeBuildRequest {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub compose: Vec<String>,
+            pub compose_env: Vec<std::collections::HashMap<String, String>>,
+            pub profiles: Vec<Vec<String>>,
+            pub harbor: Vec<bool>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ComposeBuildRequest".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "compose" => intermediate_rep.compose.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    "composeEnv" => return std::result::Result::Err(
+                        "Parsing a container in this style is not supported in ComposeBuildRequest"
+                            .to_string(),
+                    ),
+                    "profiles" => return std::result::Result::Err(
+                        "Parsing a container in this style is not supported in ComposeBuildRequest"
+                            .to_string(),
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "harbor" => intermediate_rep.harbor.push(
+                        <bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ComposeBuildRequest".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ComposeBuildRequest {
+            compose: intermediate_rep
+                .compose
+                .into_iter()
+                .next()
+                .ok_or_else(|| "compose missing in ComposeBuildRequest".to_string())?,
+            compose_env: intermediate_rep.compose_env.into_iter().next(),
+            profiles: intermediate_rep.profiles.into_iter().next(),
+            harbor: intermediate_rep.harbor.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ComposeBuildRequest> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ComposeBuildRequest>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ComposeBuildRequest>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ComposeBuildRequest - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ComposeBuildRequest> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ComposeBuildRequest as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ComposeBuildRequest - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct ConnectSandbox {
     /// Timeout in seconds from the current time after which the sandbox should expire
     #[serde(rename = "timeout")]

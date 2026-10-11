@@ -91,6 +91,16 @@ func TestComposeCreateRouting(t *testing.T) {
 	if got := requestTimeoutFor(r, 10*time.Minute); got != 10*time.Minute {
 		t.Fatalf("configured deadline shortened: %v", got)
 	}
+	r.URL.Path = "/sandboxes-compose/plan"
+	if got := requestTimeoutFor(r, 30*time.Second); got != 60*time.Second {
+		t.Fatalf("Compose planning deadline: %v", got)
+	}
+	if shouldRecordAssignment(r, routeSourceSchedule, false) {
+		t.Fatal("planning must not record a sandbox assignment")
+	}
+	if hint, err := buildScheduleHint(r); err != nil || hint != nil {
+		t.Fatalf("planning must not request sandbox resources: %v, %v", hint, err)
+	}
 	r.Method = http.MethodGet
 	if got := requestTimeoutFor(r, time.Second); got != time.Second {
 		t.Fatalf("non-create deadline changed: %v", got)

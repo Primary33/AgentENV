@@ -802,6 +802,26 @@ components:
           type: string
           description: Additional kernel command-line arguments appended to the Firecracker boot args for this cold-start sandbox. Arguments are whitespace-separated and may contain only 0-9, a-z, A-Z, underscore, hyphen, dot, slash, plus, or equals sign, so base64 values are allowed. The server also applies the firecracker.allowed_extra_boot_args_prefixes allowlist; non-matching or invalid arguments are silently ignored.
 
+    ComposeBuildRequest:
+      type: object
+      required: [compose]
+      properties:
+        compose:
+          type: string
+          minLength: 1
+          maxLength: 1048576
+          description: Compose YAML or JSON to validate and normalize for image builds. Files are read only by the client.
+        composeEnv:
+          $ref: "#/components/schemas/EnvVars"
+        profiles:
+          type: array
+          items:
+            type: string
+        harbor:
+          type: boolean
+          default: false
+          description: Apply Harbor task defaults before validation.
+
     NewComposeSandbox:
       type: object
       required: [compose]
@@ -1859,6 +1879,40 @@ paths:
           $ref: "#/components/responses/400"
         "409":
           $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandboxes-compose/plan:
+    post:
+      description: >
+        Validate a Compose build and return normalized compose and per-service build settings.
+        Reads no client files and allocates no builders or sandboxes. Planning has a 30-second deadline.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ComposeBuildRequest"
+      responses:
+        "200":
+          description: Compose build plan
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                description: Contains compose (normalized project) and services (name, context, dockerfile, args, target, noCache).
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
         "500":
           $ref: "#/components/responses/500"
 
