@@ -95,6 +95,10 @@ const SNAPSHOT_RECORDS_PREFIX: &str = "catalog/records/";
 pub enum DocumentCollection {
     VolumeRecords,
     SnapshotRecords,
+    /// Published image descriptions, keyed by digest.
+    Images,
+    /// Image tags, keyed by canonical `name:tag`.
+    ImageTags,
 }
 
 impl DocumentCollection {
@@ -103,6 +107,8 @@ impl DocumentCollection {
         match self {
             Self::VolumeRecords => VOLUME_RECORDS_PREFIX,
             Self::SnapshotRecords => SNAPSHOT_RECORDS_PREFIX,
+            Self::Images => IMAGES_PREFIX,
+            Self::ImageTags => IMAGE_TAGS_PREFIX,
         }
     }
 
@@ -112,15 +118,25 @@ impl DocumentCollection {
         match self {
             Self::VolumeRecords => Some(DocumentKey::VolumeRecord(id.to_owned())),
             Self::SnapshotRecords => SnapshotId::parse(id).ok().map(DocumentKey::SnapshotRecord),
+            Self::Images => DocumentKey::image(id).ok(),
+            Self::ImageTags => canonical_image_tag(id).map(DocumentKey::ImageTag),
         }
     }
 
     /// Extracts the ID from a file name under [`Self::prefix`].
     pub(crate) fn id_from_file_name(self, file_name: &str) -> Option<&str> {
+        let id = file_name.strip_suffix(".json");
         match self {
-            Self::VolumeRecords | Self::SnapshotRecords => file_name.strip_suffix(".json"),
+            Self::VolumeRecords | Self::SnapshotRecords => id,
+            Self::Images => id.filter(|digest| crate::digest::is_sha256_digest(digest)),
+            Self::ImageTags => id.filter(|tag| canonical_image_tag(tag).is_some()),
         }
     }
+}
+
+/// The tag named by `id`, which must already be in canonical `name:tag` form.
+fn canonical_image_tag(id: &str) -> Option<ImageTag> {
+    ImageTag::parse(id).ok().filter(|tag| tag.as_ref() == id)
 }
 
 /// One blob a repository stores. Like [`DocumentKey`], this is the only place
@@ -260,10 +276,26 @@ mod tests {
             format!("catalog/images/{digest}.lock")
         );
         assert!(DocumentKey::image("sha256:../../outside").is_err());
+        let images = DocumentCollection::Images;
+        assert!(image.path().starts_with(images.prefix()));
+        assert!(images.key(&digest).is_some());
+        assert!(images.key("sha256:short").is_none());
+        let file_name = format!("{digest}.json");
+        assert_eq!(images.id_from_file_name(&file_name), Some(digest.as_str()));
+        assert_eq!(images.id_from_file_name(&format!("{digest}.lock")), None);
+        assert_eq!(images.id_from_file_name("sha256:short.json"), None);
         let tag = DocumentKey::ImageTag(ImageTag::parse("web").unwrap());
         assert_eq!(tag.path(), "catalog/image-tags/web:latest.json");
         assert_eq!(tag.posix_path(), tag.path());
         assert_eq!(tag.posix_lock_path(), "catalog/image-tags/web:latest.lock");
+        let tags = DocumentCollection::ImageTags;
+        assert!(tag.path().starts_with(tags.prefix()));
+        assert!(tags.key("web:latest").is_some());
+        assert!(tags.key("web").is_none());
+        assert_eq!(tags.id_from_file_name("web:v1.json"), Some("web:v1"));
+        assert_eq!(tags.id_from_file_name("web:v1.lock"), None);
+        assert_eq!(tags.id_from_file_name("web.json"), None);
+        assert_eq!(tags.id_from_file_name("Web:v1.json"), None);
     }
 
     #[test]

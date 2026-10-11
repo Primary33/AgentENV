@@ -639,11 +639,15 @@ func isImageBuilderAllocation(r *http.Request) bool {
 	return r.Method == http.MethodPost && strings.TrimRight(r.URL.Path, "/") == "/images/builds"
 }
 
-// Image tags live in the shared repository and have no worker binding.
+// Image records and tags live in the shared repository and have no worker binding.
 func isImageCatalogRequest(r *http.Request) bool {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	return len(parts) == 3 && parts[0] == "images" && parts[1] == "tags" &&
-		(r.Method == http.MethodGet || r.Method == http.MethodPut)
+	if parts[0] != "images" {
+		return false
+	}
+	return len(parts) == 1 && r.Method == http.MethodGet ||
+		len(parts) == 2 && parts[1] != "builds" && (r.Method == http.MethodGet || r.Method == http.MethodDelete) ||
+		len(parts) == 3 && parts[1] == "tags" && (r.Method == http.MethodGet || r.Method == http.MethodPut || r.Method == http.MethodDelete)
 }
 
 func (s *Server) logHostRoutingHeaderConflicts(r *http.Request, route *hostRoute) {

@@ -1116,6 +1116,42 @@ components:
         memoryMB:
           $ref: "#/components/schemas/MemoryMB"
 
+    ImageSummary:
+      type: object
+      required: [imageDigest, os, architecture, layerCount]
+      properties:
+        imageDigest:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+        os:
+          type: string
+        architecture:
+          type: string
+        layerCount:
+          type: integer
+          format: uint32
+    ImagePage:
+      type: object
+      required: [images]
+      properties:
+        images:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImageSummary'
+        nextToken:
+          type: string
+          description: Digest cursor for the next page; omitted at the end. Concurrent publication and deletion may change subsequent pages.
+    ImageDetails:
+      type: object
+      required: [imageDigest, description]
+      properties:
+        imageDigest:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+        description:
+          type: object
+          description: Immutable OverlayBD description containing schemaVersion, os, architecture, ordered layers, and OCI runtime config. Its canonical JSON SHA256 is imageDigest.
+
     ImageBuildRequest:
       type: object
       additionalProperties: false
@@ -1171,6 +1207,17 @@ components:
         imageDigest:
           type: string
           pattern: '^sha256:[0-9a-f]{64}$'
+    ImageTagPage:
+      type: object
+      required: [tags]
+      properties:
+        tags:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImageTag'
+        nextToken:
+          type: string
+          description: Tag cursor for the next page; omitted at the end. Concurrent changes may change subsequent pages.
 
     TemplateBuilderRequest:
       type: object
@@ -1637,8 +1684,84 @@ tags:
   - name: sandboxes
   - name: snapshots
   - name: volumes
+  - name: images
 
 paths:
+  /images:
+    get:
+      summary: List published images
+      description: Lists images in the configured shared repository, ordered by digest. A cursor continues after the last scanned digest, even if that image has since been deleted.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            format: uint32
+            minimum: 1
+            maximum: 100
+            default: 100
+        - name: nextToken
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Published image page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagePage'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '500':
+          $ref: '#/components/responses/500'
+  /images/{imageDigest}:
+    parameters:
+      - name: imageDigest
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Inspect a published image
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Published image details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageDetails'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '404':
+          $ref: '#/components/responses/404'
+        '500':
+          $ref: '#/components/responses/500'
+    delete:
+      summary: Delete a published image
+      description: Idempotently removes the image description. New resolutions fail until the image is published again. Existing workloads and snapshots retain their layers. Shared layer data is retained; deletion does not reclaim repository storage immediately.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '204':
+          description: Image deleted
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '500':
+          $ref: '#/components/responses/500'
   /images/builds:
     post:
       summary: Prepare an image build
@@ -1715,6 +1838,39 @@ paths:
           $ref: '#/components/responses/409'
         '500':
           $ref: '#/components/responses/500'
+  /images/tags:
+    get:
+      summary: List image tags
+      description: Lists tags in the configured shared repository, ordered by name:tag. A cursor continues after the last scanned tag, even if that tag has since been deleted. A listed tag may point to an image that has been deleted.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            format: uint32
+            minimum: 1
+            maximum: 100
+            default: 100
+        - name: nextToken
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Image tag page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageTagPage'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '500':
+          $ref: '#/components/responses/500'
   /images/tags/{tag}:
     parameters:
       - name: tag
@@ -1769,6 +1925,21 @@ paths:
           $ref: '#/components/responses/401'
         '404':
           $ref: '#/components/responses/404'
+        '500':
+          $ref: '#/components/responses/500'
+    delete:
+      summary: Delete an image tag
+      description: Idempotently removes the tag. The image it points to stays published, and existing workloads are unaffected.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '204':
+          description: Image tag deleted
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
         '500':
           $ref: '#/components/responses/500'
 

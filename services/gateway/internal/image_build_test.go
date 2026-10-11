@@ -110,8 +110,13 @@ func TestImageCatalogRoutesWithoutBuildOrSandboxBinding(t *testing.T) {
 		},
 	}, time.Second, 1024)
 	for _, operation := range []struct{ method, path, body, label string }{
+		{"GET", "/images?limit=1", "", "/images"},
+		{"GET", "/images/" + digest, "", "/images/{image_digest}"},
+		{"DELETE", "/images/" + digest, "", "/images/{image_digest}"},
+		{"GET", "/images/tags?limit=1", "", "/images/tags"},
 		{"GET", "/images/tags/web:v1", "", "/images/tags/{tag}"},
 		{"PUT", "/images/tags/web:v1", `{"imageDigest":"` + digest + `"}`, "/images/tags/{tag}"},
+		{"DELETE", "/images/tags/web:v1", "", "/images/tags/{tag}"},
 	} {
 		request := httptest.NewRequest(operation.method, operation.path, strings.NewReader(operation.body))
 		request.Header.Set(headerSandboxID, "unrelated")
