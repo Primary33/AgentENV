@@ -22,6 +22,8 @@ const MaxServices = 24
 const MaxPlanBytes = 4 * 1024 * 1024
 
 type Request struct {
+	Mode        string            `json:"mode,omitempty"`
+	Harbor      bool              `json:"harbor,omitempty"`
 	Compose     string            `json:"compose"`
 	Environment map[string]string `json:"composeEnv,omitempty"`
 	Profiles    []string          `json:"profiles,omitempty"`
@@ -42,7 +44,7 @@ type Plan struct {
 // Validate the raw tree before invoking the loader, which can otherwise read
 // env_file/include/extends/configs during normalization.
 func Prepare(ctx context.Context, request Request) (*Plan, error) {
-	project, err := loadProject(ctx, request)
+	project, err := loadProject(ctx, request, false)
 	if err != nil {
 		return nil, err
 	}
@@ -72,13 +74,21 @@ func parseDocument(source string) (map[string]any, error) {
 	return raw, nil
 }
 
-func loadProject(ctx context.Context, request Request) (*types.Project, error) {
+func loadProject(ctx context.Context, request Request, allowBuild bool) (*types.Project, error) {
 	raw, err := parseDocument(request.Compose)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateRaw(raw); err != nil {
+	if err := validateRaw(raw, allowBuild); err != nil {
 		return nil, err
+	}
+	if request.Harbor {
+		if !allowBuild {
+			return nil, fmt.Errorf("harbor defaults are only supported in build mode")
+		}
+		if err := applyHarborDefaults(raw); err != nil {
+			return nil, err
+		}
 	}
 	budget := expansionBudget{MaxPlanBytes}
 	project, err := loader.LoadWithContext(ctx, types.ConfigDetails{
@@ -122,13 +132,13 @@ func loadProject(ctx context.Context, request Request) (*types.Project, error) {
 	if len(project.Services) == 0 || len(project.Services) > MaxServices {
 		return nil, fmt.Errorf("compose must select 1..%d services", MaxServices)
 	}
-	return project, validateProject(project)
+	return project, validateProject(project, allowBuild)
 }
 
-func validateProject(project *types.Project) error {
+func validateProject(project *types.Project, allowBuild bool) error {
 	for _, name := range project.ServiceNames() {
 		service := project.Services[name]
-		if service.Image == "" {
+		if service.Image == "" && (!allowBuild || service.Build == nil) {
 			return fmt.Errorf("services.%s.image is required", name)
 		}
 		if service.Platform != "" && service.Platform != "linux/amd64" {
@@ -185,7 +195,7 @@ func runtimePlan(project *types.Project) (*Plan, error) {
 	return plan, nil
 }
 
-// The output contains active services only and survives the next Compose load
+// Both outputs contain active services only and survive the next Compose load
 // without interpolating literal dollars again.
 func renderProject(project *types.Project) (json.RawMessage, error) {
 	for name, service := range project.Services {
@@ -238,7 +248,7 @@ func allowedKeys(value map[string]any, path, allowed string) error {
 	return nil
 }
 
-func validateRaw(raw map[string]any) error {
+func validateRaw(raw map[string]any, allowBuild bool) error {
 	if err := allowedKeys(raw, "", "name version services networks volumes"); err != nil {
 		return err
 	}
@@ -252,6 +262,17 @@ func validateRaw(raw map[string]any) error {
 			return fmt.Errorf("services.%s must be a mapping", name)
 		}
 		allowed := "image platform command entrypoint environment user working_dir depends_on healthcheck restart ports expose networks network_mode cap_add volumes tmpfs profiles labels hostname init stop_signal stop_grace_period read_only shm_size mem_limit cpus"
+		if allowBuild {
+			allowed += " build pull_policy"
+			if policy, ok := s["pull_policy"]; ok && policy != "build" {
+				return fmt.Errorf("services.%s.pull_policy only supports build", name)
+			}
+			if build, ok := s["build"].(map[string]any); ok {
+				if err := allowedKeys(build, "services."+name+".build.", "context dockerfile args target no_cache"); err != nil {
+					return err
+				}
+			}
+		}
 		if err := allowedKeys(s, "services."+name+".", allowed); err != nil {
 			return err
 		}
@@ -362,4 +383,87 @@ func (b *expansionBudget) substitute(value string, mapping template.Mapping) (st
 		return "", budgetErr
 	}
 	return result, err
+}
+
+type BuildService struct {
+	Name       string            `json:"name"`
+	Context    string            `json:"context"`
+	Dockerfile string            `json:"dockerfile"`
+	Args       map[string]string `json:"args"`
+	Target     string            `json:"target,omitempty"`
+	NoCache    bool              `json:"noCache,omitempty"`
+}
+
+type BuildPlan struct {
+	Compose  json.RawMessage `json:"compose"`
+	Services []BuildService  `json:"services"`
+}
+
+// PrepareBuild shares the runtime validation/interpolation rules, but permits
+// local Dockerfile builds. Paths are resolved by the CLI, never by the server.
+func PrepareBuild(ctx context.Context, request Request) (*BuildPlan, error) {
+	project, err := loadProject(ctx, request, true)
+	if err != nil {
+		return nil, err
+	}
+	plan := &BuildPlan{}
+	names := project.ServiceNames()
+	sort.Strings(names)
+	for _, name := range names {
+		service := project.Services[name]
+		if build := service.Build; build != nil {
+			context := build.Context
+			if context == "" {
+				context = "."
+			}
+			if strings.Contains(context, "://") || strings.HasPrefix(context, "git@") || strings.Contains(context, "#") || context == "-" {
+				return nil, fmt.Errorf("services.%s.build.context must be a local directory", name)
+			}
+			dockerfile := build.Dockerfile
+			if dockerfile == "" {
+				dockerfile = "Dockerfile"
+			}
+			args := map[string]string{}
+			for key, value := range build.Args {
+				if value != nil {
+					args[key] = *value
+				} else if resolved, ok := request.Environment[key]; ok {
+					args[key] = resolved
+				}
+			}
+			plan.Services = append(plan.Services, BuildService{
+				Name: name, Context: context, Dockerfile: dockerfile,
+				Args: args, Target: build.Target, NoCache: build.NoCache,
+			})
+			service.Image = "aenv-build/" + name + ":pending"
+		}
+		service.Build = nil
+		service.PullPolicy = ""
+		project.Services[name] = service
+	}
+	plan.Compose, err = renderProject(project)
+	if err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
+// Harbor's docker-compose-build.yaml supplies these defaults before merging a
+// task's environment/docker-compose.yaml. Enable explicitly so generic Compose
+// projects keep their own main service behavior.
+func applyHarborDefaults(raw map[string]any) error {
+	services := raw["services"].(map[string]any)
+	main, ok := services["main"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("--harbor requires a main service")
+	}
+	if _, hasBuild := main["build"]; !hasBuild {
+		if _, hasImage := main["image"]; !hasImage {
+			main["build"] = map[string]any{"context": "."}
+		}
+	}
+	if _, exists := main["command"]; !exists {
+		main["command"] = []any{"sh", "-c", "sleep infinity"}
+	}
+	return nil
 }

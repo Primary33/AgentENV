@@ -14,7 +14,16 @@ func main() {
 	if err := json.NewDecoder(os.Stdin).Decode(&request); err != nil {
 		fail(err)
 	}
-	plan, err := compose.Prepare(context.Background(), request)
+	var plan any
+	var err error
+	switch request.Mode {
+	case "":
+		plan, err = compose.Prepare(context.Background(), request)
+	case "build":
+		plan, err = compose.PrepareBuild(context.Background(), request)
+	default:
+		err = fmt.Errorf("unknown planner mode %q", request.Mode)
+	}
 	if err != nil {
 		fail(err)
 	}

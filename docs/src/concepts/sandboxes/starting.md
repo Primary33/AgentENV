@@ -180,7 +180,7 @@ planner_binary = "/usr/local/bin/aenv-compose-plan"
 
 Environment overrides are `AENV_COMPOSE_BASE_IMAGE` and
 `AENV_COMPOSE_PLANNER_BINARY`. Sandbox creation is disabled when no base image is
-set.
+set; build planning only requires the planner.
 The server Docker image and release bundle include the planner.
 
 The guest kernel needs `CONFIG_CGROUPS`, `CONFIG_NAMESPACES`, `CONFIG_VETH`,
@@ -197,6 +197,95 @@ docker build --platform linux/amd64 -f compose-image/Dockerfile \
 [kernel]
 image_path = "/absolute/path/compose-kernel/vmlinux-compose-6.1.175"
 ```
+
+### Build service images
+
+If services specify `build`, first use the CLI's Compose build mode:
+
+```sh
+aenv build --compose compose.yaml --output compose.built.yaml
+aenv compose up -f compose.built.yaml
+```
+
+`aenv build --compose` builds the active services' Dockerfiles with the remote
+BuildKit builder, one image build (`POST /v3/templates` with `imageOnly`) per
+service, as `aenv build --image` does. The server converts each finished
+image to OverlayBD and publishes its layers and description to the configured
+OSS or POSIX repository. No destination registry is required. It does not start the service
+containers or create runnable VM templates. Services that already specify only
+`image` are retained. The runtime API continues to accept image-only
+projects; it does not receive local build contexts.
+
+Like Docker Compose, each service's image is named `PROJECT-SERVICE` and tagged
+`latest`, so it can also be referenced as `aenv/PROJECT-SERVICE:latest`. The
+project defaults to the name of the Compose file's directory; set it with
+`--name`. Both names are lowercased, and other characters become single `-`
+separators. Each build moves the `latest` tag; the output file still pins
+every built service by digest. Each service build leaves a build record, which
+`DELETE /templates/{buildID}` removes while keeping the image and its tags.
+
+The CLI requests a build plan from `POST /sandboxes-compose/plan` on the server.
+This authenticated endpoint accepts `compose`, `composeEnv`, `profiles`, and
+`harbor`, and returns normalized Compose plus per-service build instructions.
+It has a 30-second planning budget, reads no local files, and allocates no builders
+or sandboxes. Only the server needs `aenv-compose-plan`; upgrade it together with
+the CLI. Build contexts are subsequently uploaded from the client to BuildKit.
+
+| Flag | Description |
+|------|-------------|
+| `--compose <path>` | Local Compose YAML or JSON file. |
+| `--name <project>` | Project name prefixing service image names; defaults to the Compose file's directory name. |
+| `--image-repository <registry/repository>` | Optional: additionally push images to this registry and reference the pushed tags instead of the repository image. See "Registry distribution" below. |
+| `--output <path>` | Output file; defaults to `compose.built.yaml` beside the input. Must not already exist. |
+| `--env KEY=VALUE` | Explicit interpolation/build argument environment; repeatable, last value wins. Process environment and `.env` files are not loaded. |
+| `--profile <name>` | Select optional services; repeatable. Selected profiles are resolved into the output. |
+| `--harbor` | Apply Harbor's main-service build and keepalive defaults before normalizing a task's Compose override file. Explicit task settings take precedence. |
+| `--registry-insecure` | Permit HTTP or untrusted TLS for pushes to a development registry. Runtime registry access must be configured separately. |
+
+Shared build flags `--no-cache`, `--buildctl`, `--progress`, and `--timeout` also
+apply (`--timeout` is per service). Put per-service build arguments in the Compose
+file. Supported build fields are `context`, `dockerfile`, `args`, `target`, and
+`no_cache`, including the `build: ./directory` shorthand. Contexts must be local
+directories; relative contexts resolve beside the Compose file and Dockerfiles
+resolve relative to their build context. As in Compose, a context may lie
+outside the Compose file's directory; the CLI uploads every context the file
+names. Images are built for the builder's platform; the Compose runtime
+requires x86-64.
+
+The input file is unchanged. The output is JSON, which Compose accepts as YAML,
+and contains no `build` or `pull_policy: build` entries. It is written only after
+every service succeeds; partial failures may leave published images in the repository. Unsupported Compose features and missing build files are rejected
+before allocating builders. The server must support the image build API.
+
+#### Registry distribution
+
+To share images with consumers outside the shared AgentENV repository or use
+registry retention, pass
+`--image-repository REGISTRY/REPOSITORY`. Each build then additionally pushes a
+unique tag, and the built file references those tags instead of OverlayBD description digests.
+The repository must be reachable from both the builder VM and the runtime node.
+BuildKit uses the CLI user's Docker registry credentials for push. Runtime nodes
+need their own pull credentials. For private registry addresses, the node's
+`network.egress.always_denied_cidrs` must permit builder access. The registry
+cannot run on the builder's own node: the node rejects connections that VMs open
+to the host's addresses.
+`--registry-insecure` changes TLS handling only; it does not bypass the node's
+network policy. The CLI installer bundles `aenv-buildctl`; a local Docker daemon
+is not required.
+
+For Terminal-Bench 4.0 tasks, use the original environment directory, and name
+the project after the task because every task's Compose file is in `environment/`:
+
+```sh
+aenv build --compose tasks/freight-dispatch-shift/environment/docker-compose.yaml \
+  --harbor --name freight-dispatch-shift --output freight.built.yaml
+aenv compose up -f freight.built.yaml --cpu 4 --memory 8192
+```
+
+`--harbor` supplies `main.build.context: .` when neither image nor build is set,
+and `main.command: [sh, -c, sleep infinity]` when command is omitted, matching
+Harbor's build base configuration. It prepares the task environment; it does not
+run Harbor agents, inject verifier files, or grade benchmark solutions.
 
 ### Create a sandbox
 
@@ -289,3 +378,24 @@ Inline builds at the runtime API, replicas/scaling, host bind mounts, external f
 `extends`, `label_file`), secrets/configs, external networks/volumes, custom volume
 drivers, host networking/devices, privileged mode, and UDP publishing are rejected.
 Named volumes live in the sandbox root disk; they are not AgentENV managed volumes.
+
+### Validate Compose builds
+
+To test original Terminal-Bench 4.0 Compose environments on an isolated node:
+
+```sh
+git clone --depth 1 --branch v4.0.0 https://github.com/harbor-framework/terminal-bench.git
+AENV_API_URL=http://127.0.0.1:8001 AENV_API_KEY=... \
+  python3 compose-image/test_e2e.py terminal-bench --tasks terminal-bench/tasks \
+  --results tb4-results
+```
+
+The script tests all tasks containing `environment/docker-compose.yaml`, or
+repeat `--task NAME` to select tasks. It uses `aenv build --harbor` followed by
+`aenv compose up`, checks service health and execution in `main`, records timings
+and source hashes, and deletes each sandbox. Built-file reports are retained.
+This validates environment startup, not benchmark solution scores.
+
+With the image catalog API installed, set `AENV_IMAGE_CATALOG_TEST=1` to also
+verify that deleting a shared service image preserves running services, snapshots,
+pause/resume, and forks. Standalone image/catalog tests run with `make test-buildkit`.
