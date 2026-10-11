@@ -73,6 +73,50 @@ pub enum ImagesBuildsPostResponse {
     Status500_ServerError(models::Error),
 }
 
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum ImagesGetResponse {
+    /// Published image page
+    Status200_PublishedImagePage(models::ImagePage),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum ImagesImageDigestDeleteResponse {
+    /// Image deleted
+    Status204_ImageDeleted,
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum ImagesImageDigestGetResponse {
+    /// Published image details
+    Status200_PublishedImageDetails(models::ImageDetails),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
 /// Images
 #[async_trait]
 #[allow(clippy::ptr_arg)]
@@ -131,4 +175,43 @@ pub trait Images<E: std::fmt::Debug + Send + Sync + 'static = ()>: super::ErrorH
         claims: &Self::Claims,
         body: &models::ImageBuildRequest,
     ) -> Result<ImagesBuildsPostResponse, E>;
+
+    /// List published images.
+    ///
+    /// ImagesGet - GET /images
+    async fn images_get(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        query_params: &models::ImagesGetQueryParams,
+    ) -> Result<ImagesGetResponse, E>;
+
+    /// Delete a published image.
+    ///
+    /// ImagesImageDigestDelete - DELETE /images/{imageDigest}
+    async fn images_image_digest_delete(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::ImagesImageDigestDeletePathParams,
+    ) -> Result<ImagesImageDigestDeleteResponse, E>;
+
+    /// Inspect a published image.
+    ///
+    /// ImagesImageDigestGet - GET /images/{imageDigest}
+    async fn images_image_digest_get(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::ImagesImageDigestGetPathParams,
+    ) -> Result<ImagesImageDigestGetResponse, E>;
 }

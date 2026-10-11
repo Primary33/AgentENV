@@ -103,6 +103,151 @@ async fn cache_volume(api: &ApiImpl, name: &str, mode: VolumeMode, owner: &str) 
     Ok(id)
 }
 
+#[tokio::test]
+async fn image_catalog_api_paginates_and_deletes_without_removing_shared_layers() -> Result<()> {
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+        Router,
+    };
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+    async fn call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        authorized: bool,
+    ) -> Result<(StatusCode, Value)> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "localhost");
+        if authorized {
+            request = request.header("x-api-key", "build-cleanup-test-api-key-0123456789");
+        }
+        let response = app.clone().oneshot(request.body(Body::empty())?).await?;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 65536).await?;
+        Ok((
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        ))
+    }
+    let (root, api, _) = test_api(VolumeLimits::default()).await?;
+    let app = crate::api::server::new(Arc::new(api.clone()));
+    assert_eq!(
+        call(&app, "GET", "/images", false).await?.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&app, "GET", "/images", true).await?.1,
+        json!({"images": []})
+    );
+    let repository = api.snapshot_manager.repository();
+    let (_, _, manifest) =
+        crate::snapshot::mock::write_mock_built_artifacts(&root.path().join("image-source"))?;
+    let layers = repository
+        .publish_image_layers(&manifest.rootfs.image_config_path)
+        .await?;
+    let image =
+        crate::image::PublishedImage::new("amd64".into(), layers.clone(), json!({"Cmd": ["true"]}));
+    let (first, repeat) = tokio::join!(repository.put_image(&image), repository.put_image(&image));
+    let first = first?;
+    assert_eq!(first, repeat?);
+    let other =
+        crate::image::PublishedImage::new("amd64".into(), layers, json!({"Cmd": ["false"]}));
+    let mut digests = [first.clone(), repository.put_image(&other).await?];
+    digests.sort();
+    let (status, page) = call(&app, "GET", "/images?limit=1", true).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["images"][0]["imageDigest"], digests[0]);
+    assert_eq!(page["nextToken"], digests[0]);
+    assert!(page["images"][0].get("description").is_none());
+    let detail = call(&app, "GET", &format!("/images/{first}"), true).await?;
+    assert_eq!(detail.0, StatusCode::OK);
+    assert_eq!(detail.1["description"], serde_json::to_value(&image)?);
+    let resolved = api.image_resolver.resolve(&digests[0]).await?;
+    let config = overlaybd::config::load_image_config(&resolved.overlaybd_config_path)?;
+    for _ in 0..2 {
+        assert_eq!(
+            call(&app, "DELETE", &format!("/images/{}", digests[0]), true)
+                .await?
+                .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    assert_eq!(
+        call(&app, "GET", &format!("/images/{}", digests[0]), true)
+            .await?
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert!(matches!(
+        api.image_resolver.resolve(&digests[0]).await,
+        Err(crate::image::ImageError::NotFound { .. })
+    ));
+    assert!(resolved.overlaybd_config_path.exists());
+    assert!(config
+        .lowers
+        .iter()
+        .all(|layer| std::path::Path::new(&layer.file).is_file()));
+    let page = call(
+        &app,
+        "GET",
+        &format!("/images?limit=1&nextToken={}", digests[0]),
+        true,
+    )
+    .await?
+    .1;
+    assert_eq!(page["images"][0]["imageDigest"], digests[1]);
+    assert!(page.get("nextToken").is_none());
+    assert!(api
+        .image_resolver
+        .resolve(&digests[1])
+        .await?
+        .overlaybd_config_path
+        .is_file());
+    for uri in [
+        "/images?limit=0",
+        "/images?limit=101",
+        "/images?nextToken=invalid",
+        "/images/sha256:invalid",
+    ] {
+        assert_eq!(
+            call(&app, "GET", uri, true).await?.0,
+            StatusCode::BAD_REQUEST,
+            "{uri}"
+        );
+    }
+    assert_eq!(
+        call(&app, "DELETE", "/images/invalid", true).await?.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&app, "GET", "/images/builds", true).await?.0,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    assert_eq!(
+        call(&app, "GET", "/images/builds/missing", true).await?.0,
+        StatusCode::NOT_FOUND
+    );
+    assert!(api
+        .volume_manager
+        .list_page(None, 100)
+        .await?
+        .records
+        .is_empty());
+    let deleted = if digests[0] == first { &image } else { &other };
+    assert_eq!(repository.put_image(deleted).await?, digests[0]);
+    assert_eq!(
+        call(&app, "GET", &format!("/images/{}", digests[0]), true)
+            .await?
+            .0,
+        StatusCode::OK
+    );
+    Ok(())
+}
+
 mod content_proto {
     tonic::include_proto!("containerd.services.content.v1");
 }

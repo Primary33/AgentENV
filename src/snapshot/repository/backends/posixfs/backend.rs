@@ -513,6 +513,24 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
             .await
     }
 
+    async fn list_image_digests(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> RepositoryResult<Vec<String>> {
+        let after = after.map(str::to_owned);
+        self.run_catalog("list images", move |store| {
+            store.list_image_digests(after.as_deref(), limit)
+        })
+        .await
+    }
+
+    async fn delete_image(&self, digest: &str) -> RepositoryResult<()> {
+        let digest = digest.to_owned();
+        self.run_catalog("delete image", move |store| store.delete_image(&digest))
+            .await
+    }
+
     async fn get_image(
         &self,
         digest: &str,

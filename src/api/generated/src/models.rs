@@ -124,6 +124,30 @@ pub struct ImagesBuildsBuildIdLogsGetQueryParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImagesGetQueryParams {
+    #[serde(rename = "limit")]
+    #[validate(range(min = 1u32, max = 100u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(rename = "nextToken")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImagesImageDigestDeletePathParams {
+    pub image_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImagesImageDigestGetPathParams {
+    pub image_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxesGetQueryParams {
     /// Metadata query used to filter the sandboxes (e.g. \"user=abc&app=prod\"). Each key and values must be URL encoded.
     #[serde(rename = "metadata")]
@@ -2643,6 +2667,520 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ImageBuilder
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into ImageBuilder - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImageDetails {
+    #[serde(rename = "imageDigest")]
+    #[validate(
+            regex(path = *RE_IMAGEDETAILS_IMAGE_DIGEST),
+          custom(function = "check_xss_string"),
+    )]
+    pub image_digest: String,
+
+    /// Immutable OverlayBD description containing schemaVersion, os, architecture, ordered layers, and OCI runtime config. Its canonical JSON SHA256 is imageDigest.
+    #[serde(rename = "description")]
+    pub description: crate::types::Object,
+}
+
+lazy_static::lazy_static! {
+    static ref RE_IMAGEDETAILS_IMAGE_DIGEST: regex::Regex = regex::Regex::new("^sha256:[0-9a-f]{64}$").unwrap();
+}
+
+impl ImageDetails {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(image_digest: String, description: crate::types::Object) -> ImageDetails {
+        ImageDetails {
+            image_digest,
+            description,
+        }
+    }
+}
+
+/// Converts the ImageDetails value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ImageDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("imageDigest".to_string()),
+            Some(self.image_digest.to_string()),
+            // Skipping description in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ImageDetails value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ImageDetails {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub image_digest: Vec<String>,
+            pub description: Vec<crate::types::Object>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ImageDetails".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "imageDigest" => intermediate_rep.image_digest.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "description" => intermediate_rep.description.push(
+                        <crate::types::Object as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ImageDetails".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ImageDetails {
+            image_digest: intermediate_rep
+                .image_digest
+                .into_iter()
+                .next()
+                .ok_or_else(|| "imageDigest missing in ImageDetails".to_string())?,
+            description: intermediate_rep
+                .description
+                .into_iter()
+                .next()
+                .ok_or_else(|| "description missing in ImageDetails".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ImageDetails> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ImageDetails>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ImageDetails>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ImageDetails - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ImageDetails> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ImageDetails as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ImageDetails - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImagePage {
+    #[serde(rename = "images")]
+    #[validate(nested)]
+    pub images: Vec<models::ImageSummary>,
+
+    /// Digest cursor for the next page; omitted at the end. Concurrent publication and deletion may change subsequent pages.
+    #[serde(rename = "nextToken")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+}
+
+impl ImagePage {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(images: Vec<models::ImageSummary>) -> ImagePage {
+        ImagePage {
+            images,
+            next_token: None,
+        }
+    }
+}
+
+/// Converts the ImagePage value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ImagePage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping images in query parameter serialization
+            self.next_token
+                .as_ref()
+                .map(|next_token| ["nextToken".to_string(), next_token.to_string()].join(",")),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ImagePage value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ImagePage {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub images: Vec<Vec<models::ImageSummary>>,
+            pub next_token: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ImagePage".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    "images" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in ImagePage"
+                                .to_string(),
+                        );
+                    }
+                    #[allow(clippy::redundant_clone)]
+                    "nextToken" => intermediate_rep.next_token.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ImagePage".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ImagePage {
+            images: intermediate_rep
+                .images
+                .into_iter()
+                .next()
+                .ok_or_else(|| "images missing in ImagePage".to_string())?,
+            next_token: intermediate_rep.next_token.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ImagePage> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ImagePage>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ImagePage>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ImagePage - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ImagePage> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ImagePage as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ImagePage - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImageSummary {
+    #[serde(rename = "imageDigest")]
+    #[validate(
+            regex(path = *RE_IMAGESUMMARY_IMAGE_DIGEST),
+          custom(function = "check_xss_string"),
+    )]
+    pub image_digest: String,
+
+    #[serde(rename = "os")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub os: String,
+
+    #[serde(rename = "architecture")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub architecture: String,
+
+    #[serde(rename = "layerCount")]
+    pub layer_count: u32,
+}
+
+lazy_static::lazy_static! {
+    static ref RE_IMAGESUMMARY_IMAGE_DIGEST: regex::Regex = regex::Regex::new("^sha256:[0-9a-f]{64}$").unwrap();
+}
+
+impl ImageSummary {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        image_digest: String,
+        os: String,
+        architecture: String,
+        layer_count: u32,
+    ) -> ImageSummary {
+        ImageSummary {
+            image_digest,
+            os,
+            architecture,
+            layer_count,
+        }
+    }
+}
+
+/// Converts the ImageSummary value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ImageSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("imageDigest".to_string()),
+            Some(self.image_digest.to_string()),
+            Some("os".to_string()),
+            Some(self.os.to_string()),
+            Some("architecture".to_string()),
+            Some(self.architecture.to_string()),
+            Some("layerCount".to_string()),
+            Some(self.layer_count.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ImageSummary value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ImageSummary {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub image_digest: Vec<String>,
+            pub os: Vec<String>,
+            pub architecture: Vec<String>,
+            pub layer_count: Vec<u32>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ImageSummary".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "imageDigest" => intermediate_rep.image_digest.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "os" => intermediate_rep.os.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "architecture" => intermediate_rep.architecture.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "layerCount" => intermediate_rep.layer_count.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ImageSummary".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ImageSummary {
+            image_digest: intermediate_rep
+                .image_digest
+                .into_iter()
+                .next()
+                .ok_or_else(|| "imageDigest missing in ImageSummary".to_string())?,
+            os: intermediate_rep
+                .os
+                .into_iter()
+                .next()
+                .ok_or_else(|| "os missing in ImageSummary".to_string())?,
+            architecture: intermediate_rep
+                .architecture
+                .into_iter()
+                .next()
+                .ok_or_else(|| "architecture missing in ImageSummary".to_string())?,
+            layer_count: intermediate_rep
+                .layer_count
+                .into_iter()
+                .next()
+                .ok_or_else(|| "layerCount missing in ImageSummary".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ImageSummary> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ImageSummary>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ImageSummary>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ImageSummary - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ImageSummary> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ImageSummary as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ImageSummary - {err}"#
                     )),
                 }
             }

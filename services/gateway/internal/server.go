@@ -216,7 +216,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	} else if isSandboxControlPlaneRequest(r) {
 		sandboxID, hasSandbox = sandboxIDFromPath(r.URL.Path)
 		routeSource = routeSourcePath
-	} else if isTemplateBuilderAllocation(r) || isImageBuilderAllocation(r) {
+	} else if isTemplateBuilderAllocation(r) || isImageBuilderAllocation(r) || isImageCatalogRequest(r) {
 		routeSource = routeSourceSchedule
 	} else if buildID, ok := imageBuildIDFromPath(r.URL.Path); ok {
 		sandboxID, hasSandbox = buildID, true
@@ -690,6 +690,16 @@ func isImageBuilderAllocation(r *http.Request) bool {
 	return r.Method == http.MethodPost && strings.TrimRight(r.URL.Path, "/") == "/images/builds"
 }
 
+// Image records live in the shared repository and have no worker binding.
+func isImageCatalogRequest(r *http.Request) bool {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if parts[0] != "images" {
+		return false
+	}
+	return len(parts) == 1 && r.Method == http.MethodGet ||
+		len(parts) == 2 && parts[1] != "builds" && (r.Method == http.MethodGet || r.Method == http.MethodDelete)
+}
+
 func imageBuildIDFromPath(path string) (string, bool) {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if (len(parts) != 3 && len(parts) != 4) || parts[0] != "images" || parts[1] != "builds" || parts[2] == "" {
@@ -1011,6 +1021,7 @@ func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
 		!templateBuildRequest &&
 		!imageBuildRequest &&
 		!isImageBuilderAllocation(r) &&
+		!isImageCatalogRequest(r) &&
 		!isTemplateBuilderAllocation(r) &&
 		hasCompleteProxyRouteHeaders(r.Header)
 }

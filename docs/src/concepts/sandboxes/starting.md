@@ -133,3 +133,28 @@ deletion. The node's build journal retains results and heartbeat routing without
 occupying a build slot. Image builds do not create template records. The existing
 template builder API continues to publish runnable VM snapshots. Upgrade the
 server, gateway, and CLI together to use the image API.
+
+### Manage published images
+
+Published images have a separate resource API, using the same API-key authentication:
+
+| Request | Result |
+| --- | --- |
+| `GET /images?limit=100` | Digest-ordered summaries with platform and layer count; `limit` is 1–100. |
+| `GET /images?limit=100&nextToken=...` | Continue using the preceding response's `nextToken`; omission means the end. |
+| `GET /images/{imageDigest}` | The digest and complete immutable OverlayBD description, including OCI runtime configuration. |
+| `DELETE /images/{imageDigest}` | Remove the description; returns `204` even if already absent. |
+
+Images and volumes share layer publication and local config generation. Their
+catalog records and lifecycles are independent. Image management can run on any
+node using the shared repository; build progress and logs still route to the
+build node. BuildKit's `imageName` identifies its temporary export and is not a
+user-managed image tag.
+
+Deleting an image prevents new resolutions, including local cache hits. Existing
+workloads, pause/resume, forks, and snapshots retain their captured layers. Layer
+objects remain in shared storage, so deletion does not immediately reclaim disk
+or OSS space. A concurrent or later build can publish the same digest again.
+Completed build results remain historical records even if their image is deleted.
+Pagination is not a frozen view: concurrent publication and deletion may change
+later pages; continue while `nextToken` is present, including after an empty page.

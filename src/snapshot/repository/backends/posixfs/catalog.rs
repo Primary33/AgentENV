@@ -71,6 +71,47 @@ impl PosixFsCatalogStore {
             .map_err(|error| RepositoryError::backend("verify image description", error))
     }
 
+    pub(crate) fn list_image_digests(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> RepositoryResult<Vec<String>> {
+        let entries = match fs::read_dir(self.root.join("catalog/images")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(RepositoryError::backend("list images", error)),
+        };
+        // Bound memory while selecting a stable page from an unordered directory.
+        let mut digests = std::collections::BTreeSet::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| RepositoryError::backend("list image entry", error))?;
+            let name = entry.file_name();
+            let Some(digest) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+                continue;
+            };
+            if crate::image::buildkit::validate_digest(digest).is_err()
+                || after.is_some_and(|after| digest <= after)
+            {
+                continue;
+            }
+            digests.insert(digest.to_owned());
+            if digests.len() > limit {
+                digests.pop_last();
+            }
+        }
+        Ok(digests.into_iter().collect())
+    }
+
+    pub(crate) fn delete_image(&self, digest: &str) -> RepositoryResult<()> {
+        let key = crate::image::PublishedImage::key(digest).map_err(|error| {
+            RepositoryError::InvalidRequest {
+                reason: error.to_string(),
+            }
+        })?;
+        self.remove_file_if_exists(&self.root.join(key))
+    }
+
     pub(crate) fn write_build_logs(
         &self,
         id: &SnapshotId,

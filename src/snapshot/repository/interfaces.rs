@@ -329,6 +329,20 @@ pub trait SnapshotRepository: Send + Sync {
         unsupported("image catalog")
     }
 
+    /// Lists at most `limit` image digests in lexical order after the cursor.
+    async fn list_image_digests(
+        &self,
+        _after: Option<&str>,
+        _limit: usize,
+    ) -> RepositoryResult<Vec<String>> {
+        unsupported("image catalog")
+    }
+
+    /// Removes the description only. Shared layers remain owned by the repository.
+    async fn delete_image(&self, _digest: &str) -> RepositoryResult<()> {
+        unsupported("image catalog")
+    }
+
     /// Removes one durable volume record. Missing records are considered success.
     async fn delete_volume(&self, _volume_id: &str) -> RepositoryResult<()> {
         unsupported("volume catalog")

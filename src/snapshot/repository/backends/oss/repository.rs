@@ -895,6 +895,51 @@ impl SnapshotRepository for OssSnapshotRepository {
         Ok(digest)
     }
 
+    async fn list_image_digests(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> RepositoryResult<Vec<String>> {
+        let after = after
+            .map(crate::image::PublishedImage::key)
+            .transpose()
+            .map_err(|error| RepositoryError::InvalidRequest {
+                reason: error.to_string(),
+            })?;
+        self.client
+            .list_keys_page("catalog/images/", after.as_deref(), limit)
+            .await
+            .map_err(|error| RepositoryError::backend("list images", error))?
+            .into_iter()
+            .map(|key| {
+                let digest = key
+                    .strip_prefix("catalog/images/")
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .ok_or_else(|| RepositoryError::InvalidRequest {
+                        reason: "invalid image catalog key".into(),
+                    })?;
+                crate::image::buildkit::validate_digest(digest).map_err(|error| {
+                    RepositoryError::InvalidRequest {
+                        reason: error.to_string(),
+                    }
+                })?;
+                Ok(digest.to_owned())
+            })
+            .collect()
+    }
+
+    async fn delete_image(&self, digest: &str) -> RepositoryResult<()> {
+        let key = crate::image::PublishedImage::key(digest).map_err(|error| {
+            RepositoryError::InvalidRequest {
+                reason: error.to_string(),
+            }
+        })?;
+        self.client
+            .delete(&key)
+            .await
+            .map_err(|error| RepositoryError::backend("delete image", error))
+    }
+
     async fn get_image(
         &self,
         digest: &str,
@@ -2202,7 +2247,7 @@ mod tests {
         use crate::image::PublishedImage;
         use axum::{
             body::{Body, Bytes},
-            extract::{Path as Key, State},
+            extract::{Path as Key, Query, State},
             http::{Method, Response, StatusCode},
             routing::any,
             Router,
@@ -2211,13 +2256,56 @@ mod tests {
         async fn object(
             State(objects): State<Objects>,
             Key(key): Key<String>,
+            Query(query): Query<std::collections::HashMap<String, String>>,
             method: Method,
             body: Bytes,
         ) -> Response<Body> {
             let mut objects = objects.lock().await;
+            if method == Method::GET && query.contains_key("list-type") {
+                let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+                let after = query
+                    .get("continuation-token")
+                    .or_else(|| query.get("start-after"))
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let limit = query
+                    .get("max-keys")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(1000);
+                let mut keys: Vec<_> = objects
+                    .keys()
+                    .filter_map(|key| key.strip_prefix("bucket/"))
+                    .filter(|key| key.starts_with(prefix) && *key > after)
+                    .collect();
+                keys.sort();
+                let truncated = keys.len() > limit;
+                keys.truncate(limit);
+                let mut xml = format!("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>bucket</Name><IsTruncated>{truncated}</IsTruncated>");
+                for key in &keys {
+                    xml.push_str(&format!(
+                        "<Contents><Key>{key}</Key><Size>{}</Size><LastModified>2026-01-01T00:00:00Z</LastModified></Contents>",
+                        objects[&format!("bucket/{key}")].len()
+                    ));
+                }
+                if truncated {
+                    xml.push_str(&format!(
+                        "<NextContinuationToken>{}</NextContinuationToken>",
+                        keys.last().unwrap()
+                    ));
+                }
+                xml.push_str("</ListBucketResult>");
+                return Response::new(Body::from(xml));
+            }
             if method == Method::PUT {
                 objects.insert(key, body.to_vec());
                 return Response::new(Body::empty());
+            }
+            if method == Method::DELETE {
+                objects.remove(&key);
+                return Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(Body::empty())
+                    .unwrap();
             }
             match objects.get(&key) {
                 Some(bytes) => Response::builder()
@@ -2276,6 +2364,8 @@ mod tests {
             let image = PublishedImage::new("amd64".into(), layers, json!({"Cmd": ["serve"]}));
             let digest = publisher.put_image(&image).await?;
             assert_eq!(publisher.put_image(&image).await?, digest);
+            let (one, two) = tokio::join!(publisher.put_image(&image), publisher.put_image(&image));
+            assert_eq!(one?, two?);
             drop(source);
             let reader = repository()?;
             let fetched = reader.get_image(&digest).await?.unwrap();
@@ -2304,6 +2394,34 @@ mod tests {
                 .get_image(&crate::digest::sha256_digest(b"missing"))
                 .await?
                 .is_none());
+            let other = PublishedImage::new(
+                "amd64".into(),
+                image.layers.clone(),
+                json!({"Cmd": ["other"]}),
+            );
+            let other_digest = publisher.put_image(&other).await?;
+            let mut expected = vec![digest.clone(), other_digest.clone()];
+            expected.sort();
+            assert_eq!(reader.list_image_digests(None, 10).await?, expected);
+            assert_eq!(reader.list_image_digests(None, 1).await?, expected[..1]);
+            assert_eq!(
+                reader.list_image_digests(Some(&expected[0]), 1).await?,
+                expected[1..]
+            );
+            for _ in 0..2 {
+                reader.delete_image(&other_digest).await?;
+            }
+            assert!(reader.get_image(&other_digest).await?.is_none());
+            assert_eq!(
+                reader.list_image_digests(None, 10).await?,
+                vec![digest.clone()]
+            );
+            for layer in &config.lowers {
+                assert!(objects
+                    .lock()
+                    .await
+                    .contains_key(&format!("bucket/prefix/managed-layers/{}", layer.digest)));
+            }
             objects.lock().await.insert(key, b"tampered".to_vec());
             assert!(reader.get_image(&digest).await.is_err());
             Ok::<_, anyhow::Error>(())

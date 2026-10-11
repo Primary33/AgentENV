@@ -695,6 +695,98 @@ impl ApiImpl {
 impl Images<()> for ApiImpl {
     type Claims = super::Claims;
 
+    async fn images_get(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        query: &models::ImagesGetQueryParams,
+    ) -> Result<ImagesGetResponse, ()> {
+        use ImagesGetResponse::*;
+        let limit = query.limit.unwrap_or(100) as usize;
+        if !(1..=100).contains(&limit) {
+            return Ok(Status400_BadRequest(Self::error(
+                400,
+                "limit must be between 1 and 100",
+            )));
+        }
+        if let Some(cursor) = &query.next_token {
+            if let Err(error) = crate::image::buildkit::validate_digest(cursor) {
+                return Ok(Status400_BadRequest(Self::error(400, error.to_string())));
+            }
+        }
+        Ok(
+            match self
+                .list_images_page(query.next_token.as_deref(), limit)
+                .await
+            {
+                Ok(page) => Status200_PublishedImagePage(page),
+                Err(error) => Status500_ServerError(Self::internal_error(error.as_ref())),
+            },
+        )
+    }
+
+    async fn images_image_digest_get(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path: &models::ImagesImageDigestGetPathParams,
+    ) -> Result<ImagesImageDigestGetResponse, ()> {
+        use ImagesImageDigestGetResponse::*;
+        if let Err(error) = crate::image::buildkit::validate_digest(&path.image_digest) {
+            return Ok(Status400_BadRequest(Self::error(400, error.to_string())));
+        }
+        let result: Result<Option<models::ImageDetails>> = async {
+            let image = self
+                .snapshot_manager
+                .repository()
+                .get_image(&path.image_digest)
+                .await?;
+            image
+                .map(|image| {
+                    Ok(models::ImageDetails::new(
+                        path.image_digest.clone(),
+                        agentenv_http_server::types::Object(serde_json::to_value(image)?),
+                    ))
+                })
+                .transpose()
+        }
+        .await;
+        Ok(match result {
+            Ok(Some(image)) => Status200_PublishedImageDetails(image),
+            Ok(None) => Status404_NotFound(Self::error(404, "image not found")),
+            Err(error) => Status500_ServerError(Self::internal_error(error.as_ref())),
+        })
+    }
+
+    async fn images_image_digest_delete(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path: &models::ImagesImageDigestDeletePathParams,
+    ) -> Result<ImagesImageDigestDeleteResponse, ()> {
+        use ImagesImageDigestDeleteResponse::*;
+        if let Err(error) = crate::image::buildkit::validate_digest(&path.image_digest) {
+            return Ok(Status400_BadRequest(Self::error(400, error.to_string())));
+        }
+        Ok(
+            match self
+                .snapshot_manager
+                .repository()
+                .delete_image(&path.image_digest)
+                .await
+            {
+                Ok(()) => Status204_ImageDeleted,
+                Err(error) => Status500_ServerError(Self::internal_error(&error)),
+            },
+        )
+    }
+
     async fn images_builds_post(
         &self,
         _method: &Method,
@@ -803,6 +895,32 @@ impl Images<()> for ApiImpl {
 }
 
 impl ApiImpl {
+    async fn list_images_page(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<models::ImagePage> {
+        let repository = self.snapshot_manager.repository();
+        let mut digests = repository.list_image_digests(after, limit + 1).await?;
+        let has_more = digests.len() > limit;
+        digests.truncate(limit);
+        let mut page = models::ImagePage::new(Vec::with_capacity(digests.len()));
+        // A concurrent delete can remove a listed record. Advance past scanned
+        // keys even when a page becomes empty, so pagination always makes progress.
+        page.next_token = has_more.then(|| digests.last().cloned()).flatten();
+        for digest in digests {
+            if let Some(image) = repository.get_image(&digest).await? {
+                page.images.push(models::ImageSummary::new(
+                    digest,
+                    image.os,
+                    image.architecture,
+                    image.layers.len() as u32,
+                ));
+            }
+        }
+        Ok(page)
+    }
+
     async fn require_image_build(&self, id: &str) -> Result<SnapshotId, models::Error> {
         let parsed =
             SnapshotId::parse(id).map_err(|_| Self::error(404, "image build not found"))?;

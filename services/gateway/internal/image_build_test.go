@@ -96,3 +96,47 @@ func TestImageBuildAllocationRecordsAssignment(t *testing.T) {
 		}
 	}
 }
+
+func TestImageCatalogRoutesWithoutBuildOrSandboxBinding(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleFunc: func(_ context.Context, req *schedulerv1.ScheduleRequest, _ ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			if req.GetHint() != nil {
+				t.Error("catalog access must not request sandbox resources")
+			}
+			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "reader", Endpoint: upstream.URL}}, nil
+		},
+		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			t.Fatal("catalog access must not look up a worker")
+			return nil, nil
+		},
+		recordAssignmentFunc: func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			t.Fatal("catalog access must not create a binding")
+			return nil, nil
+		},
+	}, time.Second, 1024)
+	for _, operation := range []struct{ method, path, label string }{
+		{"GET", "/images?limit=1", "/images"},
+		{"GET", "/images/" + digest, "/images/{image_digest}"},
+		{"DELETE", "/images/" + digest, "/images/{image_digest}"},
+	} {
+		request := httptest.NewRequest(operation.method, operation.path, nil)
+		request.Header.Set(headerSandboxID, "unrelated")
+		request.Header.Set(headerTargetPort, "1234")
+		if server.isSandboxDataPlaneRequest(request) {
+			t.Fatal("catalog access must require API authentication")
+		}
+		if label := gatewayRouteLabel(request.URL.Path); label != operation.label {
+			t.Fatalf("unexpected metric label %q", label)
+		}
+		response := httptest.NewRecorder()
+		authenticatedTestHandler(server).ServeHTTP(response, request)
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("status=%d %s", response.Code, response.Body.String())
+		}
+	}
+}
