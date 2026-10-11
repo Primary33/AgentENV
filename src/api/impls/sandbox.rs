@@ -665,6 +665,39 @@ fn validate_domain_allowlist(policy: &SandboxNetworkPolicy) -> anyhow::Result<()
 impl Sandboxes<()> for ApiImpl {
     type Claims = super::Claims;
 
+    async fn sandboxes_compose_plan_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        body: &models::ComposeBuildRequest,
+    ) -> Result<SandboxesComposePlanPostResponse, ()> {
+        use SandboxesComposePlanPostResponse::*;
+        let request = serde_json::json!({
+            "mode": "build", "compose": body.compose,
+            "composeEnv": body.compose_env.clone().unwrap_or_default(),
+            "profiles": body.profiles.clone().unwrap_or_default(),
+            "harbor": body.harbor.unwrap_or(false),
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            compose::prepare(
+                &ConfigManager::global_config().compose.planner_binary,
+                request,
+            ),
+        )
+        .await;
+        Ok(match result {
+            Ok(Ok(plan)) => Status200_ComposeBuildPlan(plan),
+            Ok(Err(err)) if err.is::<compose::InvalidCompose>() => {
+                Status400_BadRequest(Self::error(400, err.to_string()))
+            }
+            Ok(Err(err)) => Status500_ServerError(Self::internal_error(err.as_ref())),
+            Err(_) => Status500_ServerError(Self::error(500, "Compose planning deadline exceeded")),
+        })
+    }
+
     async fn sandboxes_compose_post(
         &self,
         _method: &Method,

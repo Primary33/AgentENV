@@ -3,10 +3,13 @@
 
 AENV_API_URL=http://127.0.0.1:8001 AENV_API_KEY=... python3 compose-image/test_e2e.py
 Creates and deletes only this test's sandboxes and snapshots.
+Set AENV_IMAGE_CATALOG_TEST=1 to also check image deletion when that API is installed.
 """
+import argparse
+import hashlib
+import sys
 from contextlib import contextmanager
 import json
-import sys
 import os
 import re
 import signal
@@ -158,6 +161,18 @@ class ComposeE2E(unittest.TestCase):
         return self.request("GET", "/", headers={"x-agentenv-sandbox-id": sandbox,
                                                  "x-agentenv-target-port": str(port)}, raw=True).strip()
 
+    def test_build_planning_without_allocations(self):
+        before = self.request("GET", "/sandboxes")
+        source = "services: {main: {build: {context: ./missing, args: {VALUE: '${VALUE}'}}, profiles: [task]}}"
+        body = {"compose": source, "composeEnv": {"VALUE": "$literal"}, "profiles": ["task"], "harbor": True}
+        plan = self.request("POST", "/sandboxes-compose/plan", body)
+        self.assertEqual(plan["services"][0]["context"], "./missing")
+        self.assertEqual(plan["services"][0]["args"]["VALUE"], "$literal")
+        self.assertNotIn("build", plan["compose"]["services"]["main"])
+        self.assertEqual(plan["compose"]["services"]["main"]["command"], ["sh", "-c", "sleep infinity"])
+        self.request("POST", "/sandboxes-compose/plan", body, expected=(401,), headers={"X-API-Key": "invalid"})
+        self.request("POST", "/sandboxes-compose/plan", {"compose": "services: {main: {env_file: secret.env}}"}, expected=(400,))
+        self.assertEqual(self.request("GET", "/sandboxes"), before)
 
     def test_cli_compose_up(self):
         source = COMPOSE.replace("  b:\n", "  b:\n    profiles: [worker]\n")
@@ -186,7 +201,146 @@ class ComposeE2E(unittest.TestCase):
         self.assertIn("HTTP 400", result.stderr)
         print("CLI creates ready services with profiles and explicit environment; API errors propagate", flush=True)
 
+    def test_native_image_build_lifecycle(self):
+        context = self.work / "native-image"
+        context.mkdir()
+        (context / "Dockerfile").write_text(
+            f"FROM busybox:1.37\nRUN echo {self.work.name} >/marker\n"
+            'ENV IMAGE_KIND=native\nCMD ["sleep", "infinity"]\n')
+        result = subprocess.run([os.environ.get("AENV_CLI", "aenv"), "build", "--image", str(context),
+                                 "--progress", "plain"], env=self.env, capture_output=True, text=True, timeout=900)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        digest = result.stdout.strip()
+        self.assertRegex(digest, r"^sha256:[0-9a-f]{64}$")
+        catalog = os.environ.get("AENV_IMAGE_CATALOG_TEST") == "1"
+        if catalog:
+            self.addCleanup(self.request, "DELETE", f"/images/{digest}", expected=(204,))
+            detail = self.request("GET", f"/images/{digest}")
+            self.assertEqual(detail["imageDigest"], digest)
+            encoded = json.dumps(detail["description"], sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+            self.assertEqual("sha256:" + hashlib.sha256(encoded).hexdigest(), digest)
+        for build_id in re.findall(r"Allocated image build ([0-9a-f-]+)", result.stderr):
+            self.request("GET", f"/images/builds/{build_id}", expected=(404,))
+        project = json.dumps({"services": {name: {"image": digest} for name in ("a", "b")}})
+        sandbox = self.create(compose=project, composeEnv={})
+        self.execute(sandbox, "docker", "exec", "aenv-a-1", "sh", "-c", "echo private >/marker")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-b-1", "cat", "/marker"), self.work.name)
+        snapshot = self.request("POST", f"/sandboxes/{sandbox}/snapshots", {}, expected=(201,))["snapshotID"]
+        self.snapshots.append(snapshot)
+        if catalog:
+            self.request("DELETE", f"/images/{digest}", expected=(204,))
+            self.request("GET", f"/images/{digest}", expected=(404,))
+            missing = self.request("POST", "/sandboxes-cold", {"image": digest, "timeout": 60}, expected=(400,))
+            self.assertIn(digest, missing["message"])
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-a-1", "cat", "/marker"), "private")
+        self.request("POST", f"/sandboxes/{sandbox}/pause", expected=(204,))
+        self.request("POST", f"/sandboxes/{sandbox}/connect", {"timeout": 900}, expected=(201,))
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-b-1", "printenv", "IMAGE_KIND"), "native")
+        fork = self.request("POST", f"/sandboxes/{sandbox}/fork", {"count": 1, "timeout": 900}, expected=(201,))[0]["sandbox"]
+        self.sandboxes.append(fork["sandboxID"])
+        self.snapshots.append(fork["templateID"])
+        self.execute(fork["sandboxID"], "docker", "exec", "aenv-a-1", "sh", "-c", "echo child >/marker")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-a-1", "cat", "/marker"), "private")
+        restored = self.request("POST", "/sandboxes", {"templateID": snapshot, "timeout": 900}, expected=(201,))["sandboxID"]
+        self.sandboxes.append(restored)
+        self.assertEqual(self.execute(restored, "docker", "exec", "aenv-a-1", "cat", "/marker"), "private")
 
+    def test_cli_compose_build(self):
+        work = self.work
+        context = work / "context"
+        (context / "docker").mkdir(parents=True)
+        (context / "payload").write_text("context-upload")
+        (context / "excluded").write_text("must not be uploaded")
+        (context / ".dockerignore").write_text("excluded\n")
+        dockerfile = context / "docker" / "Custom"
+        dockerfile.write_text("""FROM busybox:1.37 AS app
+ARG VALUE=default
+COPY . /context
+RUN test ! -e /context/excluded && printf '%s' "$VALUE" >/build-value
+HEALTHCHECK CMD false
+FROM scratch AS unused
+""")
+        compose = work / "compose.yaml"
+        compose.write_text("""services:
+  app:
+    build:
+      context: ./context
+      dockerfile: docker/Custom
+      target: app
+      args: {VALUE: "${VALUE}"}
+    command: [sh, -c, 'mkdir -p /www; cp /context/payload /www/index.html; exec httpd -f -p 8080 -h /www']
+    environment: {LITERAL: "${VALUE}"}
+    healthcheck:
+      test: [CMD, wget, -qO-, http://localhost:8080]
+      interval: 1s
+      timeout: 1s
+      retries: 10
+  client:
+    image: busybox:1.37
+    command: [sleep, infinity]
+    depends_on: {app: {condition: service_healthy}}
+  worker:
+    build:
+      context: ./context
+      dockerfile: docker/Custom
+      target: app
+    command: [sleep, infinity]
+    healthcheck: {test: [CMD, "true"]}
+""")
+        original = compose.read_bytes()
+        output = work / "built.yaml"
+        cli = os.environ.get("AENV_CLI", "aenv")
+        command = [cli, "build", "--compose", str(compose), "--output", str(output),
+                   "--env", "VALUE=$literal=a=b", "--progress", "plain"]
+        repository = os.environ.get("AENV_BUILD_IMAGE_REPOSITORY")
+        if repository:
+            command += ["--image-repository", repository]
+            if os.environ.get("AENV_BUILD_REGISTRY_INSECURE") == "1":
+                command.append("--registry-insecure")
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=900)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        project = json.loads(output.read_text())
+        self.assertNotIn("build", project["services"]["app"])
+        self.assertNotIn("build", project["services"]["worker"])
+        self.assertEqual(project["services"]["client"]["image"], "busybox:1.37")
+        if repository:
+            self.assertTrue(project["services"]["app"]["image"].startswith(repository + ":aenv-"))
+            self.assertNotIn("x-aenv-build", project)
+        else:
+            self.assertRegex(project["services"]["app"]["image"], r"^sha256:[0-9a-f]{64}$")
+            self.assertRegex(project["services"]["worker"]["image"], r"^sha256:[0-9a-f]{64}$")
+            self.assertNotIn("x-aenv-build", project)
+        self.assertEqual(compose.read_bytes(), original)
+        build_ids = re.findall(r"Allocated image build ([0-9a-f-]+)", result.stderr)
+        self.assertEqual(len(build_ids), 2, result.stderr)
+        for build_id in build_ids:
+            self.request("GET", f"/images/builds/{build_id}", expected=(404,))
+        # Published references also work in YAML and direct API requests.
+        built_yaml = "\n".join(f"{json.dumps(key)}: {json.dumps(value)}"
+                               for key, value in project.items())
+        sandbox = self.create(compose=built_yaml, composeEnv={})
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-app-1", "cat", "/build-value"), "$literal=a=b")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-app-1", "printenv", "LITERAL"), "$literal=a=b")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-client-1", "wget", "-qO-", "http://app:8080"), "context-upload")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-worker-1", "cat", "/build-value"), "default")
+
+        # Refusing an existing destination must preserve it without allocating.
+        saved = output.read_bytes()
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already exists", result.stderr)
+        self.assertNotIn("Allocated", result.stderr)
+        self.assertEqual(output.read_bytes(), saved)
+
+        output.unlink()
+        dockerfile.write_text("FROM busybox:1.37 AS app\nRUN exit 42\n")
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=900)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exit code: 42", result.stderr)
+        self.assertFalse(output.exists(), "a partial build must not publish a runnable file")
+        build_id = re.search(r"Allocated image build ([0-9a-f-]+)", result.stderr).group(1)
+        self.request("GET", f"/images/builds/{build_id}", expected=(404,))
+        print("Compose builds preserve args/target/context/dollars, publish reusable service images, accept YAML image references, and clean build records", flush=True)
 
     def test_lifecycle(self):
         sandbox = self.create()
@@ -313,7 +467,88 @@ volumes:
         print("startup deadline reclaimed the unready sandbox and node resources", flush=True)
 
 
+def terminal_bench(argv):
+    parser = argparse.ArgumentParser(description="Build and start unmodified Terminal-Bench Compose environments")
+    parser.add_argument("--tasks", type=Path, required=True)
+    parser.add_argument("--image-repository",
+                        help="Distribute images through this registry in addition to publishing to the shared repository")
+    parser.add_argument("--registry-insecure", action="store_true")
+    parser.add_argument("--task", action="append", help="Only these task directory names")
+    parser.add_argument("--results", type=Path, required=True)
+    args = parser.parse_args(argv)
+    cli = os.environ.get("AENV_CLI", "aenv")
+    args.results.mkdir(parents=True, exist_ok=False)
+    sources = sorted(args.tasks.glob("*/environment/docker-compose.yaml"))
+    if args.task:
+        sources = [p for p in sources if p.parent.parent.name in args.task]
+        if {p.parent.parent.name for p in sources} != set(args.task):
+            parser.error("a requested task has no environment/docker-compose.yaml")
+    if not sources:
+        parser.error("no Compose tasks found")
+    report = []
+    with isolated_client() as (_, env, api, key):
+        for source in sources:
+            name = source.parent.parent.name
+            result = {"task": name, "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+            sandbox = None
+            started = time.monotonic()
+            log_path = args.results / f"{name}.log"
+            built = args.results / f"{name}.built.yaml"
+            print(f"[{name}] building original Compose configuration; log: {log_path}", flush=True)
+            try:
+                with log_path.open("w") as log:
+                    command = [cli, "build", "--compose", str(source.resolve()), "--harbor",
+                               "--output", str(built.resolve()), "--progress", "plain"]
+                    if args.image_repository:
+                        command += ["--image-repository", args.image_repository]
+                        if args.registry_insecure:
+                            command.append("--registry-insecure")
+                    subprocess.run(command, env=env, stdout=log, stderr=log,
+                                   timeout=21600, check=True)
+                    result["build_seconds"] = round(time.monotonic() - started, 2)
+                    print(f"[{name}] images built; starting sandbox", flush=True)
+                    up = subprocess.run([cli, "compose", "up", "-f", str(built),
+                                         "--cpu", "8", "--memory", "16384", "--timeout", "900"],
+                                        env=env, stdout=subprocess.PIPE, stderr=log,
+                                        text=True, timeout=420, check=True)
+                    sandbox = up.stdout.strip()
+                    result["sandbox_id"] = sandbox
+                    result["startup_seconds"] = round(time.monotonic() - started - result["build_seconds"], 2)
+                    project = json.loads(built.read_text())
+                    names = list(project["services"])
+                    inspected = json.loads(execute(env, sandbox, "docker", "inspect",
+                                                   *[f"aenv-{service}-1" for service in names]))
+                    states = {}
+                    for service, container in zip(names, inspected):
+                        state = container["State"]
+                        states[service] = {"status": state["Status"],
+                                           "health": state.get("Health", {}).get("Status"),
+                                           "exit_code": state["ExitCode"]}
+                        assert state["Status"] == "running" or (
+                            state["Status"] == "exited" and state["ExitCode"] == 0), states
+                        if state.get("Health"):
+                            assert state["Health"]["Status"] == "healthy", states
+                    execute(env, sandbox, "docker", "exec", "aenv-main-1", "sh", "-c", "true")
+                    result["services"] = states
+                    result["status"] = "passed"
+            except Exception as error:
+                result.update(status="failed", error=str(error))
+            finally:
+                if sandbox:
+                    request = urllib.request.Request(f"{api}/sandboxes/{sandbox}", method="DELETE",
+                                                     headers={"X-API-Key": key})
+                    with urllib.request.urlopen(request, timeout=120) as response:
+                        assert response.status == 204
+                assert hashlib.sha256(source.read_bytes()).hexdigest() == result["source_sha256"], "original task changed"
+                result["total_seconds"] = round(time.monotonic() - started, 2)
+                report.append(result)
+                (args.results / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+                print(f"[{name}] {result['status']} ({result['total_seconds']}s)", flush=True)
+    raise SystemExit(0 if all(result["status"] == "passed" for result in report) else 1)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    if len(sys.argv) > 1 and sys.argv[1] == "terminal-bench":
+        terminal_bench(sys.argv[2:])
+    else:
+        unittest.main(verbosity=2)

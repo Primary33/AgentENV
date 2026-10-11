@@ -14,7 +14,15 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
-	plan, err := compose.Prepare(context.Background(), request)
+	var plan any
+	switch request.Mode {
+	case "":
+		plan, err = compose.Prepare(context.Background(), request)
+	case "build":
+		plan, err = compose.PrepareBuild(context.Background(), request)
+	default:
+		err = fmt.Errorf("unknown planner mode %q", request.Mode)
+	}
 	if err != nil {
 		fail(err)
 	}
