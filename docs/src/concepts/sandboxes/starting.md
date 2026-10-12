@@ -68,7 +68,7 @@ Cold-start options:
 
 | Argument or option | Default | Description |
 |---|---|---|
-| `<image>` | Required | External OCI image reference. |
+| `<image>` | Required | External OCI image reference, published image digest (`sha256:...`), or image tag (`aenv/name:tag`). |
 | `--cold` | Required for an OCI image | Cold start directly from `<image>`. |
 | `--timeout <seconds>` | `300` | Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see [Auto-Eviction](./auto-eviction.md). |
 | `--cpu <count>` | `[machine].vcpu_count` from your AgentENV config file | Set the sandbox's vCPU count. Alias: `--cpu-count`. |
@@ -92,3 +92,56 @@ default. Shrinking below the source image size requires
 applies only when creating a fresh writable root filesystem, not to read-only
 images, images with an existing upper layer, or snapshot resume. Sandbox
 responses report the effective size as `diskSizeMB`.
+
+## Build reusable images
+
+To build a standalone image, run `aenv build --image ./app`. The command prints
+the published `sha256:...` reference on stdout; build progress goes to stderr.
+Use that reference in a sandbox `image` field, or cold start it with
+`aenv start --cold sha256:...`. Dockerfile, build
+arguments, secrets, cache, progress, and timeout flags work as for template
+builds. Template naming, startup overrides, and sandbox resource flags do not
+apply to image builds; worker resources come from the server configuration.
+
+Images are referenced by the SHA256 of its canonical OverlayBD
+image description (`sha256:...`), rather than its original OCI manifest digest.
+The description binds the ordered layer digests, platform, and OCI runtime
+configuration, including entrypoint, command, environment, and healthcheck.
+Descriptions live at `catalog/images/{digest}.json`; layer data uses the same
+content-addressed managed-layer storage as snapshots. Node-local paths are
+materialized on resolution and are not part of the image identity.
+
+Builders and runtime nodes must use the same repository. Every compatible node
+with repository access can resolve an image independently of the build node's
+cache. Local cache eviction does not remove published images. With a POSIX
+backend, cross-node use requires a shared filesystem. Publication completes
+before status becomes `ready`; failed publication does not expose a usable build
+result. Uploaded immutable objects may remain for reuse after a failed build.
+
+Image builds use the `/images/builds` API and do not create template records.
+Build status survives worker cleanup and server restart until
+`DELETE /images/builds/{buildID}`, which keeps published images and their layers.
+Upgrade the server, gateway, and CLI together to use the image API.
+
+### Tag images
+
+An image tag is a mutable `name:tag` pointer to one published image. Reference
+it as `aenv/name:tag` wherever a `sha256:...` image reference is accepted,
+for example `aenv start --cold aenv/my-app:v1`. Omitting `:tag` means
+`latest`. The name uses lowercase letters and digits joined by single `.`, `_`,
+or `-`; the tag uses letters, digits, `.`, `_`, and `-` and does not start with
+`.` or `-`. Each is at most 128 characters. Short names under `aenv/` always
+refer to tags; reference an OCI image in a registry's `aenv` namespace by its
+full name, such as `docker.io/aenv/app:v1`.
+
+`aenv build --image ./app --tag my-app:v1` tags the image after it is
+published; repeat `--tag` for more tags. Stdout still contains only the digest.
+`PUT /images/tags/{tag}` with `{"imageDigest": "sha256:..."}` creates a tag or
+moves it to another published image, and `GET /images/tags/{tag}` returns the
+digest it points to. Tags live at `catalog/image-tags/{name}:{tag}.json` in the
+shared repository.
+
+A tag resolves to its digest when a sandbox, volume, or template build uses it.
+Sandboxes, snapshots, and node caches record only the digest, so moving a tag
+later does not change existing workloads. Each tag resolution reads one more
+repository object than a digest reference.
