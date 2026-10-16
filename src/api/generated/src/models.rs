@@ -2905,7 +2905,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<MemoryMb> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct NewColdSandbox {
-    /// Explicit external OCI image reference to use as the sandbox rootfs. Cold starts may pull and convert OCI layers on a cache miss and can take tens of seconds.
+    /// External OCI image reference, published OverlayBD description digest (sha256:...), or image tag (aenv/name[:tag]) to use as the sandbox rootfs. Published images and tags are resolved from the configured shared repository. Cold starts may pull and convert OCI layers on a cache miss and can take tens of seconds.
     #[serde(rename = "image")]
     #[validate(custom(function = "check_xss_string"))]
     pub image: String,
@@ -9592,6 +9592,19 @@ pub struct TemplateBuildInfo {
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<models::BuildStatusReason>,
+
+    /// AgentENV extension. Published image of a ready imageOnly build, usable as a sandbox image reference.
+    #[serde(rename = "imageDigest")]
+    #[validate(
+            regex(path = *RE_TEMPLATEBUILDINFO_IMAGE_DIGEST),
+          custom(function = "check_xss_string"),
+    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
+}
+
+lazy_static::lazy_static! {
+    static ref RE_TEMPLATEBUILDINFO_IMAGE_DIGEST: regex::Regex = regex::Regex::new("^sha256:[0-9a-f]{64}$").unwrap();
 }
 
 impl TemplateBuildInfo {
@@ -9610,6 +9623,7 @@ impl TemplateBuildInfo {
             build_id,
             status,
             reason: None,
+            image_digest: None,
         }
     }
 }
@@ -9636,6 +9650,9 @@ impl std::fmt::Display for TemplateBuildInfo {
             // Skipping status in query parameter serialization
 
             // Skipping reason in query parameter serialization
+            self.image_digest.as_ref().map(|image_digest| {
+                ["imageDigest".to_string(), image_digest.to_string()].join(",")
+            }),
         ];
 
         write!(
@@ -9663,6 +9680,7 @@ impl std::str::FromStr for TemplateBuildInfo {
             pub build_id: Vec<String>,
             pub status: Vec<models::TemplateBuildStatus>,
             pub reason: Vec<models::BuildStatusReason>,
+            pub image_digest: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -9710,6 +9728,10 @@ impl std::str::FromStr for TemplateBuildInfo {
                         <models::BuildStatusReason as std::str::FromStr>::from_str(val)
                             .map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "imageDigest" => intermediate_rep.image_digest.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing TemplateBuildInfo".to_string(),
@@ -9750,6 +9772,7 @@ impl std::str::FromStr for TemplateBuildInfo {
                 .next()
                 .ok_or_else(|| "status missing in TemplateBuildInfo".to_string())?,
             reason: intermediate_rep.reason.into_iter().next(),
+            image_digest: intermediate_rep.image_digest.into_iter().next(),
         })
     }
 }
@@ -9951,6 +9974,11 @@ pub struct TemplateBuildRequestV3 {
     #[validate(range(min = 128u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mb: Option<u32>,
+
+    /// AgentENV extension. Build a reusable image instead of a template. The required name and the tags name the image, referenced as aenv/name:tag; an omitted tag means latest. cpuCount and memoryMB do not apply. Start the build with the Dockerfile builder; completion publishes the image and points its tags at it, and no template is created.
+    #[serde(rename = "imageOnly")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_only: Option<bool>,
 }
 
 impl TemplateBuildRequestV3 {
@@ -9961,6 +9989,7 @@ impl TemplateBuildRequestV3 {
             tags: None,
             cpu_count: None,
             memory_mb: None,
+            image_only: Some(false),
         }
     }
 }
@@ -9990,6 +10019,9 @@ impl std::fmt::Display for TemplateBuildRequestV3 {
             self.memory_mb
                 .as_ref()
                 .map(|memory_mb| ["memoryMB".to_string(), memory_mb.to_string()].join(",")),
+            self.image_only
+                .as_ref()
+                .map(|image_only| ["imageOnly".to_string(), image_only.to_string()].join(",")),
         ];
 
         write!(
@@ -10015,6 +10047,7 @@ impl std::str::FromStr for TemplateBuildRequestV3 {
             pub tags: Vec<Vec<String>>,
             pub cpu_count: Vec<u32>,
             pub memory_mb: Vec<u32>,
+            pub image_only: Vec<bool>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -10043,6 +10076,8 @@ impl std::str::FromStr for TemplateBuildRequestV3 {
                     "cpuCount" => intermediate_rep.cpu_count.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     #[allow(clippy::redundant_clone)]
                     "memoryMB" => intermediate_rep.memory_mb.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "imageOnly" => intermediate_rep.image_only.push(<bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     _ => return std::result::Result::Err("Unexpected key while parsing TemplateBuildRequestV3".to_string())
                 }
             }
@@ -10057,6 +10092,7 @@ impl std::str::FromStr for TemplateBuildRequestV3 {
             tags: intermediate_rep.tags.into_iter().next(),
             cpu_count: intermediate_rep.cpu_count.into_iter().next(),
             memory_mb: intermediate_rep.memory_mb.into_iter().next(),
+            image_only: intermediate_rep.image_only.into_iter().next(),
         })
     }
 }

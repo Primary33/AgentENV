@@ -1729,7 +1729,8 @@ mod tests {
         .unwrap();
         let snapshot_manager = Arc::new(mock_snapshot_manager());
         let template_builder = Arc::new(TemplateBuilder::new());
-        let image_resolver = Arc::new(ImageResolver::new(&AppConfig::default()));
+        let image_resolver = ImageResolver::new(&AppConfig::default())
+            .with_repository(snapshot_manager.repository());
         let volume_manager = Arc::new(
             crate::volume::VolumeManager::open_with_repository(
                 root.path().join("volumes/catalog.json"),
@@ -1742,7 +1743,7 @@ mod tests {
             orchestrator,
             snapshot_manager,
             template_builder,
-            image_resolver,
+            Arc::new(image_resolver),
             volume_manager,
             None,
             domains,

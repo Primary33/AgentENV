@@ -747,7 +747,10 @@ components:
         image:
           type: string
           description: >
-            Explicit external OCI image reference to use as the sandbox rootfs.
+            External OCI image reference, published OverlayBD description
+            digest (sha256:...), or image tag (aenv/name[:tag]) to use as the
+            sandbox rootfs. Published images and tags are resolved from the
+            configured shared repository.
             Cold starts may pull and convert OCI layers on a cache miss and can
             take tens of seconds.
         timeout:
@@ -1113,6 +1116,16 @@ components:
           $ref: "#/components/schemas/CPUCount"
         memoryMB:
           $ref: "#/components/schemas/MemoryMB"
+        imageOnly:
+          type: boolean
+          default: false
+          description: >
+            AgentENV extension. Build a reusable image instead of a template.
+            The required name and the tags name the image, referenced as
+            aenv/name:tag; an omitted tag means latest. cpuCount and memoryMB
+            do not apply. Start the build with the Dockerfile builder;
+            completion publishes the image and points its tags at it, and no
+            template is created.
 
     TemplateBuilderRequest:
       type: object
@@ -1249,6 +1262,10 @@ components:
           $ref: "#/components/schemas/TemplateBuildStatus"
         reason:
           $ref: "#/components/schemas/BuildStatusReason"
+        imageDigest:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: AgentENV extension. Published image of a ready imageOnly build, usable as a sandbox image reference.
 
     TemplateBuildLogsResponse:
       required:
@@ -1723,7 +1740,7 @@ paths:
           type: string
     put:
       summary: Prepare the BuildKit worker for a template build
-      description: Start a BuildKit worker for the template build
+      description: Start a BuildKit worker for the template build. For an imageOnly build, completion publishes the image and points its tags at it instead of publishing a template, and startCmd and readyCmd are rejected.
       tags: [templates]
       security:
         - ApiKeyAuth: []
@@ -2545,7 +2562,7 @@ paths:
   /v3/templates:
     post:
       summary: Create template (v3)
-      description: Create a new template
+      description: Create a new template, or with imageOnly, a build that publishes a reusable image
       tags: [templates]
       security:
         - ApiKeyAuth: []
@@ -2684,7 +2701,7 @@ paths:
           $ref: "#/components/responses/500"
     delete:
       summary: Delete template
-      description: Delete a template
+      description: Delete a template. For an imageOnly build, delete its build record and logs; the published image and its tags are kept.
       tags: [templates]
       security:
         - ApiKeyAuth: []

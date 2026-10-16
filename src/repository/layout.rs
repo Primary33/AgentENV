@@ -1,5 +1,5 @@
-use super::LayerRole;
-use crate::types::{SnapshotAlias, SnapshotId};
+use super::{LayerRole, RepositoryError, RepositoryResult};
+use crate::types::{ImageName, ImageTag, SnapshotAlias, SnapshotId};
 
 /// A small shared document that every backend stores at the same path relative
 /// to its repository root. This is the only place that names those paths;
@@ -18,9 +18,31 @@ pub enum DocumentKey {
     SnapshotRecord(SnapshotId),
     /// The snapshot ID that currently owns an alias.
     SnapshotAlias(SnapshotAlias),
+    /// One immutable published image description, named by its digest.
+    /// Construct it with [`DocumentKey::image`], which validates the digest.
+    Image(ImageDigest),
+    /// The image digest that an image tag currently points to, stored under
+    /// the image name that owns the tag.
+    ImageTag(ImageTag),
+    /// The record of one imageOnly build.
+    ImageBuild(SnapshotId),
 }
 
+/// A validated `sha256:<hex>` image digest. Only [`DocumentKey::image`]
+/// creates one, so an image key never leaves the repository.
+#[derive(Clone, Debug)]
+pub struct ImageDigest(String);
+
 impl DocumentKey {
+    pub(crate) fn image(digest: &str) -> RepositoryResult<Self> {
+        if !crate::digest::is_sha256_digest(digest) {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("invalid image digest '{digest}'"),
+            });
+        }
+        Ok(Self::Image(ImageDigest(digest.to_owned())))
+    }
+
     pub(crate) fn path(&self) -> String {
         match self {
             Self::BuildLog(id) => format!("snapshots/build-logs/{id}.json"),
@@ -29,6 +51,9 @@ impl DocumentKey {
             Self::VolumeAlias(name) => format!("volumes/aliases/{name}.json"),
             Self::SnapshotRecord(id) => format!("{SNAPSHOT_RECORDS_PREFIX}{id}.json"),
             Self::SnapshotAlias(alias) => format!("catalog/aliases/{alias}.json"),
+            Self::Image(digest) => format!("{IMAGES_PREFIX}{}.json", digest.0),
+            Self::ImageTag(tag) => format!("{}{}.json", image_tags_prefix(tag.name()), tag.tag()),
+            Self::ImageBuild(id) => format!("{IMAGE_BUILDS_PREFIX}{id}.json"),
         }
     }
 
@@ -52,9 +77,16 @@ impl DocumentKey {
             Self::VolumeAlias(name) => format!("volumes/aliases/{name}.lock"),
             Self::SnapshotRecord(id) => format!("{SNAPSHOT_RECORDS_PREFIX}{id}.lock"),
             Self::SnapshotAlias(alias) => format!("catalog/aliases/{alias}.lock"),
+            Self::Image(digest) => format!("{IMAGES_PREFIX}{}.lock", digest.0),
+            Self::ImageTag(tag) => format!("{}{}.lock", image_tags_prefix(tag.name()), tag.tag()),
+            Self::ImageBuild(id) => format!("{IMAGE_BUILDS_PREFIX}{id}.lock"),
             Self::BuildLog(_) => format!("{}.lock", self.path()),
         }
     }
+}
+
+fn image_tags_prefix(name: &ImageName) -> String {
+    format!("{IMAGE_TAGS_PREFIX}{name}/")
 }
 
 /// Whether `value` can be a volume ID or name: one path segment of the
@@ -68,6 +100,9 @@ pub(crate) fn is_valid_volume_component(value: &str) -> bool {
 }
 
 const VOLUME_RECORDS_PREFIX: &str = "volumes/records/";
+const IMAGES_PREFIX: &str = "images/descriptions/";
+const IMAGE_TAGS_PREFIX: &str = "images/tags/";
+const IMAGE_BUILDS_PREFIX: &str = "images/builds/";
 const SNAPSHOT_RECORDS_PREFIX: &str = "catalog/records/";
 
 /// Documents that are listed together, in ID order.
@@ -230,6 +265,28 @@ mod tests {
         assert!(record.path().starts_with(records.prefix()));
         assert_eq!(records.id_from_file_name("vol_test.json"), Some("vol_test"));
         assert_eq!(records.id_from_file_name("vol_test.lock"), None);
+
+        let digest = crate::digest::sha256_digest(b"image");
+        let image = DocumentKey::image(&digest).unwrap();
+        assert_eq!(image.path(), format!("images/descriptions/{digest}.json"));
+        assert_eq!(image.posix_path(), image.path());
+        assert_eq!(
+            image.posix_lock_path(),
+            format!("images/descriptions/{digest}.lock")
+        );
+        assert!(DocumentKey::image("sha256:../../outside").is_err());
+        let tag = DocumentKey::ImageTag(ImageTag::parse("web").unwrap());
+        assert_eq!(tag.path(), "images/tags/web/latest.json");
+        assert_eq!(tag.posix_path(), tag.path());
+        assert_eq!(tag.posix_lock_path(), "images/tags/web/latest.lock");
+        let build_id = SnapshotId::generate();
+        let build = DocumentKey::ImageBuild(build_id.clone());
+        assert_eq!(build.path(), format!("images/builds/{build_id}.json"));
+        assert_eq!(build.posix_path(), build.path());
+        assert_eq!(
+            build.posix_lock_path(),
+            format!("images/builds/{build_id}.lock")
+        );
     }
 
     #[test]
