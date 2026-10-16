@@ -1,8 +1,7 @@
-//! Resolving committed snapshots, and volume backings, into node-local
-//! runnable paths. One resolver serves every repository: files a backend can
-//! read in place are used where they are; everything else is fetched,
-//! P2P-first, into the node-local cache. A missing in-place file is an error,
-//! never a reason to fetch it from peers.
+//! Resolving committed snapshots into node-local runnable paths. One resolver
+//! serves every repository: files a backend can read in place are used where
+//! they are; everything else is fetched, P2P-first, into the node-local cache.
+//! A missing in-place file is an error, never a reason to fetch it from peers.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -10,9 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
-use overlaybd::config::{ImageConfig, LayerConfig};
 use tracing::debug;
-use uuid::Uuid;
 
 use super::artifact_cache::{CacheArtifactLease, CacheHandle, LocalArtifactCache};
 use super::p2p;
@@ -21,13 +18,14 @@ use super::runtime_support::{
     parse_firecracker_manifest, runtime_image_cache_key, RuntimeImageMaterializer,
 };
 use super::{
-    CommittedAttachedDrive, CommittedSnapshot, ManagedLayer, OverlaybdLayerRef,
-    ResolvedAttachedDrive, RunnableSnapshot, RuntimeArtifactLease, SnapshotId, SnapshotRecord,
+    CommittedAttachedDrive, CommittedSnapshot, OverlaybdLayerRef, ResolvedAttachedDrive,
+    RunnableSnapshot, RuntimeArtifactLease, SnapshotId, SnapshotRecord,
 };
 use crate::image::cache::OverlaybdLayerStore;
 use crate::p2p::P2pTransport;
 use crate::repository::{
-    BlobKey, BlobLocation, LayerRole, Repository, RepositoryError, RepositoryResult, SnapshotFile,
+    managed_layer_config, BlobKey, BlobLocation, LayerRole, Repository, RepositoryError,
+    RepositoryResult, SnapshotFile,
 };
 use crate::snapshot::SandboxSnapshotManifest;
 
@@ -407,95 +405,6 @@ impl RepositoryRuntimeResolver {
     }
 }
 
-/// Writes a volume's runtime image config for its stored backing layers.
-pub(crate) async fn materialize_volume_backing(
-    repository: &dyn Repository,
-    layers: &[OverlaybdLayerRef],
-    destination: &Path,
-) -> RepositoryResult<PathBuf> {
-    let managed_repo_blob_url = repository.managed_layers_repo_blob_url();
-    let image_config = ImageConfig {
-        lowers: layers
-            .iter()
-            .map(|layer| {
-                Ok(match layer {
-                    OverlaybdLayerRef::Managed(layer) => LayerConfig {
-                        repo_blob_url: managed_repo_blob_url.clone().unwrap_or_default(),
-                        ..managed_layer_config(repository, layer.clone(), LayerRole::Rootfs)?
-                    },
-                    OverlaybdLayerRef::External(layer) => LayerConfig {
-                        repo_blob_url: layer.repo_blob_url.clone(),
-                        digest: layer.digest.clone(),
-                        size: layer.size,
-                        ..LayerConfig::default()
-                    },
-                })
-            })
-            .collect::<RepositoryResult<_>>()?,
-        ..ImageConfig::default()
-    };
-    let parent = destination
-        .parent()
-        .ok_or_else(|| RepositoryError::Backend {
-            message: format!(
-                "volume image config '{}' has no parent",
-                destination.display()
-            ),
-            source: None,
-        })?;
-    tokio::fs::create_dir_all(parent).await.map_err(|error| {
-        RepositoryError::backend(
-            format!("create volume image config dir '{}'", parent.display()),
-            error,
-        )
-    })?;
-    let bytes = serde_json::to_vec_pretty(&image_config)
-        .map_err(|error| RepositoryError::backend("serialize volume image config", error))?;
-    let temporary = destination.with_extension(format!("tmp-{}", Uuid::now_v7().simple()));
-    if let Err(error) = tokio::fs::write(&temporary, bytes).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(RepositoryError::backend(
-            format!(
-                "write temporary volume image config '{}'",
-                temporary.display()
-            ),
-            error,
-        ));
-    }
-    if let Err(error) = tokio::fs::rename(&temporary, destination).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(RepositoryError::backend(
-            format!("install volume image config '{}'", destination.display()),
-            error,
-        ));
-    }
-    Ok(destination.to_path_buf())
-}
-
-/// A managed layer read in place when the repository allows it; otherwise
-/// overlaybd reads it by digest from the repository's `repoBlobUrl`.
-fn managed_layer_config(
-    repository: &dyn Repository,
-    layer: ManagedLayer,
-    role: LayerRole,
-) -> RepositoryResult<LayerConfig> {
-    let key = BlobKey::Layer {
-        digest: layer.digest.clone(),
-        role,
-    };
-    let file = match repository.locate_blob(&key)? {
-        BlobLocation::Local(path) => path.display().to_string(),
-        BlobLocation::Remote(_) => String::new(),
-    };
-    Ok(LayerConfig {
-        file,
-        digest: layer.digest,
-        size: layer.size,
-        uuid: layer.uuid.unwrap_or_default(),
-        ..LayerConfig::default()
-    })
-}
-
 async fn validate_managed_layers<F, Fut>(
     layers: &[(usize, String)],
     label: &str,
@@ -527,71 +436,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use object_store_operator::CredentialSource;
     use tokio::sync::Barrier;
 
     use super::*;
-    use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
-    use crate::repository::backends::oss::{OssClient, OssRepository};
-    use crate::snapshot::ExternalLayer;
 
     fn digest(index: usize) -> String {
         format!("sha256:{index:064x}")
-    }
-
-    fn oss_repository() -> OssRepository {
-        let client = OssClient::new(
-            "bucket".to_string(),
-            "https://oss.example.com".to_string(),
-            "region".to_string(),
-            "prefix".to_string(),
-            CredentialSource::Anonymous,
-            None,
-        )
-        .expect("oss client");
-        OssRepository::new(
-            Arc::new(client),
-            SnapshotImageStoragePolicy::ObjectStorage,
-            &SnapshotPublishCompressionConfig {
-                enabled: false,
-                ..Default::default()
-            },
-        )
-    }
-
-    #[tokio::test]
-    async fn materializes_volume_backing_with_backend_layer_urls() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repository = oss_repository();
-        let destination = temp.path().join("volume/image.json");
-        let layers = vec![
-            OverlaybdLayerRef::Managed(ManagedLayer {
-                digest: "sha256:managed".to_string(),
-                size: 12,
-                uuid: None,
-            }),
-            OverlaybdLayerRef::External(ExternalLayer {
-                digest: "sha256:external".to_string(),
-                repo_blob_url: "https://registry.example/v2/data/blobs".to_string(),
-                size: 24,
-            }),
-        ];
-
-        materialize_volume_backing(&repository, &layers, &destination)
-            .await
-            .expect("materialize volume config");
-        let config: ImageConfig =
-            serde_json::from_slice(&tokio::fs::read(&destination).await.unwrap()).unwrap();
-        assert_eq!(config.lowers.len(), 2);
-        assert_eq!(
-            config.lowers[0].repo_blob_url,
-            "s3://bucket/prefix/managed-layers"
-        );
-        assert_eq!(
-            config.lowers[1].repo_blob_url,
-            "https://registry.example/v2/data/blobs"
-        );
-        assert!(config.lowers.iter().all(|layer| layer.file.is_empty()));
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ use shell_util::shell_quote;
 use super::drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
 use super::version::SnapshotRuntimeVersions;
 use crate::snapshot::SandboxSnapshotManifest;
-use crate::types::{ImageConfigs, SandboxResources};
+use crate::types::{ImageConfigs, ManagedLayer, OverlaybdLayerRef, SandboxResources};
 use crate::types::{SnapshotAlias, SnapshotId};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -469,27 +469,6 @@ fn now_unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OverlaybdLayerRef {
-    Managed(ManagedLayer),
-    External(ExternalLayer),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManagedLayer {
-    pub digest: String,
-    pub size: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub uuid: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExternalLayer {
-    pub digest: String,
-    pub repo_blob_url: String,
-    pub size: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -261,7 +261,7 @@ impl VolumeManager {
             layer_count = record.backing_layers.len(),
             "materializing volume backing"
         );
-        let path = crate::snapshot::resolver::materialize_volume_backing(
+        let path = crate::repository::materialize_volume_backing(
             self.repository.as_ref(),
             &record.backing_layers,
             &destination,
