@@ -1127,6 +1127,61 @@ components:
             completion publishes the image and points its tags at it, and no
             template is created.
 
+    AssignImageTagsRequest:
+      type: object
+      additionalProperties: false
+      required: [target, tags]
+      properties:
+        target:
+          type: string
+          description: Existing image tag in name:tag format whose image the tags point to.
+        tags:
+          type: array
+          description: Tags to assign within the target's image name
+          items:
+            type: string
+    AssignedImageTags:
+      type: object
+      required: [tags, imageDigest]
+      properties:
+        tags:
+          type: array
+          description: Assigned tags of the image name
+          items:
+            type: string
+        imageDigest:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: Published image the tags point to.
+    DeleteImageTagsRequest:
+      type: object
+      additionalProperties: false
+      required: [name, tags]
+      properties:
+        name:
+          type: string
+          description: Image name
+        tags:
+          type: array
+          description: Tags to delete
+          items:
+            type: string
+    ImageTag:
+      type: object
+      required: [tag, imageDigest, createdAt]
+      properties:
+        tag:
+          type: string
+          description: The tag name. Reference the image as aenv/name:tag.
+        imageDigest:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: Published image the tag points to; usable as a sandbox image reference.
+        createdAt:
+          type: string
+          format: date-time
+          description: Time when the tag was assigned
+
     TemplateBuilderRequest:
       type: object
       properties:
@@ -1598,6 +1653,85 @@ tags:
   - name: volumes
 
 paths:
+  /images/tags:
+    post:
+      summary: Assign image tags
+      description: Points tags within the target's image name at the image the target tag points to, creating or moving them. Image tags are created only by imageOnly builds and by this operation, so a tag always points to an image built under its name. The reference aenv/name:tag resolves to the image digest when a sandbox is created, so moving a tag later does not affect existing sandboxes or snapshots.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignImageTagsRequest'
+      responses:
+        '201':
+          description: Tags assigned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssignedImageTags'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '404':
+          $ref: '#/components/responses/404'
+        '500':
+          $ref: '#/components/responses/500'
+    delete:
+      summary: Delete image tags
+      description: Idempotently removes tags from an image name. The images they point to stay published, and existing workloads are unaffected.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeleteImageTagsRequest'
+      responses:
+        '204':
+          description: Tags deleted
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '500':
+          $ref: '#/components/responses/500'
+  /images/{name}/tags:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        description: Image name
+        schema:
+          type: string
+    get:
+      summary: List image tags
+      description: Lists the tags of an image name in tag order.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Image tags
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ImageTag'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '500':
+          $ref: '#/components/responses/500'
+
   /health:
     get:
       summary: Health check

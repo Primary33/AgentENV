@@ -1669,6 +1669,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_tag_endpoints_require_api_auth_and_validate_input() {
+        let app = server::new(build_api().await);
+        assert_eq!(
+            get_status(&app, "/images/web/tags", &[]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_status(
+                &app,
+                "/images/web/tags",
+                &[(TRAFFIC_ACCESS_TOKEN_HEADER, "invalid")]
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        for (method, body, key, expected) in [
+            (
+                "POST",
+                json!({"target": "web:v1", "tags": ["prod"]}),
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "DELETE",
+                json!({"name": "web", "tags": ["prod"]}),
+                Some("incorrect"),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "POST",
+                json!({"target": "Web:v1", "tags": ["prod"]}),
+                Some(TEST_API_KEY),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "DELETE",
+                json!({"name": "web", "tags": [".prod"]}),
+                Some(TEST_API_KEY),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let mut request = http::Request::builder()
+                .method(method)
+                .uri("/images/tags")
+                .header("host", "localhost")
+                .header("content-type", "application/json");
+            if let Some(key) = key {
+                request = request.header(API_KEY_HEADER, key);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{method} {body}");
+        }
+    }
+
+    #[tokio::test]
     async fn buildkit_workers_are_hidden_with_encoded_control_path_ids() {
         let api = build_api().await;
         let id = SandboxId::new();

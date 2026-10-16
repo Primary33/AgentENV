@@ -141,7 +141,12 @@ namespace by its full name, such as `docker.io/aenv/app:v1`.
 
 Tags belong to their image name, like template tags. A build points the tag in
 `--name NAME:TAG` and every `--tag TAG` at its image, or `latest` if neither is
-given. Tags live at `images/tags/{name}/{tag}.json` in the shared repository.
+given. `POST /images/tags` with `{"target": "my-app:v1", "tags": ["prod"]}`
+points more tags of the same name at the image the target tag points to,
+`DELETE /images/tags` with `{"name": "my-app", "tags": ["prod"]}` removes tags,
+and `GET /images/my-app/tags` lists the tags of a name with their digests and
+assignment times. Tags live at `images/tags/{name}/{tag}.json` in the
+shared repository.
 
 A tag resolves to its digest when a sandbox, volume, or template build uses it.
 Sandboxes, snapshots, and node caches record only the digest, so moving a tag

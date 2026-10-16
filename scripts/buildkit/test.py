@@ -95,9 +95,16 @@ class BuildKitTests(unittest.TestCase):
         self.assertEqual((status, info["status"], info["imageDigest"]), (200, "ready", digest))
         # An image build is not a template.
         self.assertEqual(self.api("GET", f"/templates/{build}")[0], 404)
+        status, assigned = self.api("POST", "/images/tags",
+                                    {"target": f"{name}:v1", "tags": ["prod"]})
+        self.assertEqual((status, assigned), (201, {"tags": ["prod"], "imageDigest": digest}))
+        status, tags = self.api("GET", f"/images/{name}/tags")
+        self.assertEqual(status, 200, tags)
+        self.assertEqual({tag["tag"]: tag["imageDigest"] for tag in tags},
+                         {"latest": digest, "prod": digest, "v1": digest})
         self.assertEqual(self.api("DELETE", f"/templates/{build}")[0], 204)
         self.assertEqual(self.api("GET", f"/templates/{build}/builds/{build}/status")[0], 404)
-        for image in (digest, f"aenv/{name}:v1"):
+        for image in (digest, f"aenv/{name}:prod"):
             status, created = self.api("POST", "/sandboxes-cold", {"image": image, "timeout": 900})
             self.assertEqual(status, 201, created)
             sandbox = created["sandboxID"]

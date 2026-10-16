@@ -156,7 +156,7 @@ impl From<TemplateBuildStatus> for models::TemplateBuildStatus {
     }
 }
 
-fn datetime_from_unix_ms(unix_ms: i64) -> chrono::DateTime<chrono::Utc> {
+pub(super) fn datetime_from_unix_ms(unix_ms: i64) -> chrono::DateTime<chrono::Utc> {
     chrono::Utc
         .timestamp_millis_opt(unix_ms)
         .single()

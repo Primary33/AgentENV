@@ -106,34 +106,40 @@ const IMAGE_BUILDS_PREFIX: &str = "images/builds/";
 const SNAPSHOT_RECORDS_PREFIX: &str = "catalog/records/";
 
 /// Documents that are listed together, in ID order.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum DocumentCollection {
     VolumeRecords,
     SnapshotRecords,
+    /// The tags of one image name, keyed by tag.
+    ImageTags(ImageName),
 }
 
 impl DocumentCollection {
     /// The directory or object prefix that holds every document in the collection.
-    pub(crate) fn prefix(self) -> &'static str {
+    pub(crate) fn prefix(&self) -> String {
         match self {
-            Self::VolumeRecords => VOLUME_RECORDS_PREFIX,
-            Self::SnapshotRecords => SNAPSHOT_RECORDS_PREFIX,
+            Self::VolumeRecords => VOLUME_RECORDS_PREFIX.to_owned(),
+            Self::SnapshotRecords => SNAPSHOT_RECORDS_PREFIX.to_owned(),
+            Self::ImageTags(name) => image_tags_prefix(name),
         }
     }
 
     /// The key of the document with `id`; `None` when `id` is not valid for
     /// the collection.
-    pub(crate) fn key(self, id: &str) -> Option<DocumentKey> {
+    pub(crate) fn key(&self, id: &str) -> Option<DocumentKey> {
         match self {
             Self::VolumeRecords => Some(DocumentKey::VolumeRecord(id.to_owned())),
             Self::SnapshotRecords => SnapshotId::parse(id).ok().map(DocumentKey::SnapshotRecord),
+            Self::ImageTags(name) => ImageTag::new(name, id).ok().map(DocumentKey::ImageTag),
         }
     }
 
     /// Extracts the ID from a file name under [`Self::prefix`].
-    pub(crate) fn id_from_file_name(self, file_name: &str) -> Option<&str> {
+    pub(crate) fn id_from_file_name<'a>(&self, file_name: &'a str) -> Option<&'a str> {
+        let id = file_name.strip_suffix(".json");
         match self {
-            Self::VolumeRecords | Self::SnapshotRecords => file_name.strip_suffix(".json"),
+            Self::VolumeRecords | Self::SnapshotRecords => id,
+            Self::ImageTags(name) => id.filter(|tag| ImageTag::new(name, tag).is_ok()),
         }
     }
 }
@@ -257,12 +263,12 @@ mod tests {
             "catalog/aliases/base-image.lock"
         );
         let snapshots = DocumentCollection::SnapshotRecords;
-        assert!(snapshot.path().starts_with(snapshots.prefix()));
+        assert!(snapshot.path().starts_with(&snapshots.prefix()));
         assert!(snapshots.key(&snapshot_id.to_string()).is_some());
         assert!(snapshots.key("not-an-id").is_none());
 
         let records = DocumentCollection::VolumeRecords;
-        assert!(record.path().starts_with(records.prefix()));
+        assert!(record.path().starts_with(&records.prefix()));
         assert_eq!(records.id_from_file_name("vol_test.json"), Some("vol_test"));
         assert_eq!(records.id_from_file_name("vol_test.lock"), None);
 
@@ -279,6 +285,13 @@ mod tests {
         assert_eq!(tag.path(), "images/tags/web/latest.json");
         assert_eq!(tag.posix_path(), tag.path());
         assert_eq!(tag.posix_lock_path(), "images/tags/web/latest.lock");
+        let tags = DocumentCollection::ImageTags(ImageName::parse("web").unwrap());
+        assert!(tag.path().starts_with(&tags.prefix()));
+        assert_eq!(tags.key("latest").map(|key| key.path()), Some(tag.path()));
+        assert!(tags.key("../x").is_none());
+        assert_eq!(tags.id_from_file_name("V1.2-rc_3.json"), Some("V1.2-rc_3"));
+        assert_eq!(tags.id_from_file_name("v1.lock"), None);
+        assert_eq!(tags.id_from_file_name(".v1.json"), None);
         let build_id = SnapshotId::generate();
         let build = DocumentKey::ImageBuild(build_id.clone());
         assert_eq!(build.path(), format!("images/builds/{build_id}.json"));
