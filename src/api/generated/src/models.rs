@@ -4309,6 +4309,12 @@ pub struct NewSandboxV2 {
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
+
+    /// Drives to attach at launch. If the snapshot already has volume mounts or attached drives, providing this field, including an empty array, returns HTTP 400. Omit this field to restore the snapshot's drives. If the sandbox is later snapshotted, current drive state is captured into the snapshot.
+    #[serde(rename = "attachedDrives")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attached_drives: Option<Vec<models::AttachedDrive>>,
 }
 
 impl NewSandboxV2 {
@@ -4326,6 +4332,7 @@ impl NewSandboxV2 {
             custom_extension_params: None,
             mcp: None,
             volume_mounts: None,
+            attached_drives: None,
         }
     }
 }
@@ -4367,6 +4374,8 @@ impl std::fmt::Display for NewSandboxV2 {
             // Skipping mcp in query parameter serialization
 
             // Skipping volumeMounts in query parameter serialization
+
+            // Skipping attachedDrives in query parameter serialization
         ];
 
         write!(
@@ -4400,6 +4409,7 @@ impl std::str::FromStr for NewSandboxV2 {
                 Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub mcp: Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
+            pub attached_drives: Vec<Vec<models::AttachedDrive>>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -4477,6 +4487,12 @@ impl std::str::FromStr for NewSandboxV2 {
                                 .to_string(),
                         );
                     }
+                    "attachedDrives" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in NewSandboxV2"
+                                .to_string(),
+                        );
+                    }
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewSandboxV2".to_string(),
@@ -4508,6 +4524,7 @@ impl std::str::FromStr for NewSandboxV2 {
                 "Nullable types not supported in NewSandboxV2".to_string(),
             )?,
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
+            attached_drives: intermediate_rep.attached_drives.into_iter().next(),
         })
     }
 }

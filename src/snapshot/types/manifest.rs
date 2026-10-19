@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::types::ExtraDrive;
+use crate::types::{ExtraDrive, ExtraDriveKind};
 
 pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 1;
 
@@ -43,11 +43,12 @@ pub struct SandboxSnapshotManifest {
     pub memory: SnapshotMemoryArtifacts,
     pub rootfs: SnapshotRootfsArtifacts,
     pub attached_drives: Vec<SnapshotAttachedDriveArtifacts>,
-    /// Number of reserved virtio-block slots available for launch-time volumes.
+    /// Number of reserved virtio-block slots for launch-time drives.
     #[serde(default)]
     pub volume_drive_slots: usize,
     /// Number of attached drives represented by IDs in the Firecracker snapshot.
-    /// Launch-time volumes use the reserved slots that follow these drives.
+    /// Later attached drives occupy the first reserved slots, and launch-time
+    /// drives use the slots that follow them.
     #[serde(default)]
     pub physical_extra_drive_count: usize,
     /// Runtime-only startup pack reference resolved from the committed
@@ -127,16 +128,40 @@ impl SandboxSnapshotManifest {
             },
             attached_drives: Vec::new(),
             volume_drive_slots: 0,
-            physical_extra_drive_count: attached_drives.len(),
+            physical_extra_drive_count: attached_drives
+                .iter()
+                .filter(|drive| !drive.uses_reserved_slot())
+                .count(),
             memory_startup_pack: None,
         }
         .with_extra_drives(attached_drives)
     }
 
+    /// Attached drives with their own Firecracker drive IDs. Snapshots created
+    /// before reserved slots existed contain only such drives.
+    pub fn effective_physical_extra_drive_count(&self) -> usize {
+        if self.volume_drive_slots == 0 {
+            self.attached_drives.len()
+        } else {
+            self.physical_extra_drive_count
+        }
+    }
+
+    /// Reserved slots not occupied by attached drives.
+    pub fn free_drive_slots(&self) -> usize {
+        let slot_drives = self
+            .attached_drives
+            .len()
+            .saturating_sub(self.effective_physical_extra_drive_count());
+        self.volume_drive_slots.saturating_sub(slot_drives)
+    }
+
     pub fn extra_drives(&self) -> Vec<ExtraDrive> {
+        let physical_count = self.effective_physical_extra_drive_count();
         self.attached_drives
             .iter()
-            .map(|drive| ExtraDrive::Overlaybd {
+            .enumerate()
+            .map(|(index, drive)| ExtraDrive::Overlaybd {
                 drive_id: drive.drive_id.clone(),
                 image_config_path: drive.image_config_path.clone(),
                 read_only: drive.read_only,
@@ -148,7 +173,11 @@ impl SandboxSnapshotManifest {
                 .unwrap_or_else(|_| ExtraDrive::default_mount_path(&drive.drive_id)),
                 sub_path: drive.sub_path.clone(),
                 snapshot_output_dir: None,
-                volume: false,
+                kind: if index < physical_count {
+                    ExtraDriveKind::Physical
+                } else {
+                    ExtraDriveKind::LaunchSlot
+                },
             })
             .collect()
     }
@@ -291,7 +320,7 @@ mod tests {
             virtual_size: None,
             sub_path: None,
             snapshot_output_dir: None,
-            volume: false,
+            kind: ExtraDriveKind::Physical,
         };
 
         let err = SandboxSnapshotManifest::new(
@@ -328,7 +357,7 @@ mod tests {
             virtual_size: Some(0),
             sub_path: None,
             snapshot_output_dir: None,
-            volume: false,
+            kind: ExtraDriveKind::Physical,
         };
 
         let err = manifest

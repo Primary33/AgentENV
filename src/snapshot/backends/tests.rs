@@ -454,7 +454,7 @@ async fn publish_rejects_duplicate_attached_drive_ids_before_touching_catalog() 
                 virtual_size: Some(32768),
                 sub_path: None,
                 snapshot_output_dir: None,
-                volume: false,
+                kind: crate::types::ExtraDriveKind::Physical,
             },
             ExtraDrive::Overlaybd {
                 drive_id: "data".to_string(),
@@ -464,7 +464,7 @@ async fn publish_rejects_duplicate_attached_drive_ids_before_touching_catalog() 
                 virtual_size: Some(32768),
                 sub_path: None,
                 snapshot_output_dir: None,
-                volume: false,
+                kind: crate::types::ExtraDriveKind::Physical,
             },
         ],
     );

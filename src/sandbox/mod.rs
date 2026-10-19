@@ -27,7 +27,7 @@ use crate::types::{ImageConfigs, SandboxId};
 pub use crate::snapshot::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
 pub use crate::types::{
     normalize_mount_path, normalize_mount_path_for_drive, validate_drive_id, validate_mount_path,
-    validate_sub_path, ExtraDrive,
+    validate_sub_path, ExtraDrive, ExtraDriveKind,
 };
 pub use ::envd::process::Signal;
 pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};

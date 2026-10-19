@@ -98,7 +98,7 @@ async fn attached_drive_rootfs_layers_are_derived_from_resolved_lower_paths() {
             virtual_size: Some(4096),
             sub_path: None,
             snapshot_output_dir: None,
-            volume: false,
+            kind: crate::types::ExtraDriveKind::Physical,
         }])
         .expect("attached drive manifest should include virtual size");
 

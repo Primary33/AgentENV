@@ -18,10 +18,11 @@ use crate::orchestrator::{
 };
 use crate::prometheus::SandboxStageTimer;
 use crate::sandbox::custom_extension::HookStatusError;
-use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive};
+use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive, ExtraDriveKind};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
-    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotVolume,
+    CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
+    SnapshotVolume,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use crate::volume::{VolumeManager, VolumeMode};
@@ -165,6 +166,48 @@ fn check_snapshot_volume_replacement(
             "this snapshot has volume mounts, which cannot be replaced; \
              omit volumeMounts to restore them",
         ));
+    }
+    Ok(())
+}
+
+/// The restored guest keeps its captured filesystems, so launch-time attached
+/// drives are accepted only by snapshots without volumes or attached drives.
+fn check_snapshot_attached_drives(
+    committed: &CommittedSnapshot,
+    explicit_drives: bool,
+) -> Result<(), models::Error> {
+    if explicit_drives
+        && (!committed.volume_snapshots.is_empty() || !committed.attached_drives.is_empty())
+    {
+        return Err(ApiImpl::error(
+            400,
+            "this snapshot has volume mounts or attached drives, which cannot be replaced; \
+             omit attachedDrives to restore them",
+        ));
+    }
+    Ok(())
+}
+
+fn check_attached_drive_overlap(
+    drives: &[ExtraDrive],
+    volume_mounts: &HashMap<String, String>,
+) -> Result<(), models::Error> {
+    for path in volume_mounts.keys() {
+        let path = normalize_mount_path(path.into())
+            .map_err(|error| ApiImpl::error(400, error.to_string()))?;
+        if let Some(drive) = drives.iter().find(|drive| {
+            path.starts_with(drive.mount_path()) || drive.mount_path().starts_with(&path)
+        }) {
+            return Err(ApiImpl::error(
+                400,
+                format!(
+                    "attached drive '{}' mount path {} overlaps volume mount path {}",
+                    drive.drive_id(),
+                    drive.mount_path().display(),
+                    path.display()
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -698,6 +741,232 @@ fn validate_domain_allowlist(policy: &SandboxNetworkPolicy) -> anyhow::Result<()
     Ok(())
 }
 
+impl ApiImpl {
+    /// Creates a sandbox from a template or snapshot. `attached_drives` are
+    /// added at launch and are only accepted by the v2 endpoint.
+    async fn create_sandbox_from_snapshot(
+        &self,
+        body: &models::NewSandbox,
+        attached_drives: Option<&[models::AttachedDrive]>,
+    ) -> Result<SandboxesPostResponse, ()> {
+        let timer = SandboxStageTimer::new("create_warm");
+        let snapshot = match timer
+            .time(
+                "load_snapshot",
+                self.snapshot_manager.load_runnable(&body.template_id),
+            )
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                    400,
+                    format!("template {} not found", body.template_id),
+                )));
+            }
+            Err(err) => {
+                warn!(error = ?err, template_id = %body.template_id, "failed to load runnable snapshot");
+                return Ok(SandboxesPostResponse::Status500_ServerError(
+                    Self::snapshot_manager_error(&err),
+                ));
+            }
+        };
+
+        let network_policy =
+            match network_policy_from_create(body.allow_internet_access, body.network.as_ref()) {
+                Ok(network) => network,
+                Err(err) => {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                        400,
+                        err.to_string(),
+                    )));
+                }
+            };
+
+        let custom_params = body
+            .custom_extension_params
+            .as_ref()
+            .map(params_model_to_map);
+        if let Err(err) = validate_custom_extension_params(custom_params.as_ref()) {
+            return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                400,
+                err.to_string(),
+            )));
+        }
+
+        if let Err(error) = check_snapshot_volume_replacement(
+            &snapshot.committed().volume_snapshots,
+            body.volume_mounts.is_some(),
+        ) {
+            return Ok(SandboxesPostResponse::Status400_BadRequest(error));
+        }
+        if let Err(error) =
+            check_snapshot_attached_drives(snapshot.committed(), attached_drives.is_some())
+        {
+            return Ok(SandboxesPostResponse::Status400_BadRequest(error));
+        }
+        let attached_drives = attached_drives.unwrap_or_default();
+        let requested_drive_count =
+            attached_drives.len() + body.volume_mounts.as_ref().map_or(0, Vec::len);
+        let free_slots = snapshot.manifest().free_drive_slots();
+        if requested_drive_count > free_slots {
+            return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                400,
+                format!(
+                    "this snapshot has {free_slots} free drive slots, but \
+                     {requested_drive_count} attached drives and volumes were requested"
+                ),
+            )));
+        }
+        let image_resolver = self.image_resolver();
+        let attached_drives: Vec<_> = match timer
+            .time(
+                "resolve_attached_drives",
+                resolve_attached_drives(attached_drives, image_resolver.as_ref()),
+            )
+            .await
+        {
+            Ok(resolved) => resolved
+                .into_iter()
+                .map(|resolved| resolved.drive.with_kind(ExtraDriveKind::LaunchSlot))
+                .collect(),
+            Err(err) => {
+                warn!(error = %err.message, "failed to resolve attached drives");
+                return Ok(Self::client_or_server_response(
+                    err,
+                    SandboxesPostResponse::Status400_BadRequest,
+                    SandboxesPostResponse::Status500_ServerError,
+                ));
+            }
+        };
+
+        let extra_drives_in_snapshot =
+            body.volume_mounts.is_none() && !snapshot.committed().volume_snapshots.is_empty();
+        let (requested_volume_mounts, restored_volume_ids) = if let Some(mounts) =
+            body.volume_mounts.as_deref()
+        {
+            let mounts = match volume_mounts_from_model(Some(mounts)) {
+                Ok(mounts) => mounts,
+                Err(error) => {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(error));
+                }
+            };
+            if let Some(mounts) = &mounts {
+                if let Err(error) = check_attached_drive_overlap(&attached_drives, mounts) {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(error));
+                }
+            }
+            (mounts, Vec::new())
+        } else {
+            match restore_snapshot_volume_mounts(self, &snapshot).await {
+                Ok((mounts, volume_ids)) => ((!mounts.is_empty()).then_some(mounts), volume_ids),
+                Err(error) => {
+                    return Ok(match error.code {
+                        500 => SandboxesPostResponse::Status500_ServerError(error),
+                        _ => SandboxesPostResponse::Status400_BadRequest(error),
+                    });
+                }
+            }
+        };
+        let PreparedVolumeMounts {
+            owner: pending_volume_owner,
+            drives: volume_drives,
+            mounts: volume_mounts,
+            volume_ids: reserved_volume_ids,
+        } = match prepare_volume_mounts(self, requested_volume_mounts.as_ref()).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                return Ok(match error.code {
+                    500.. => SandboxesPostResponse::Status500_ServerError(error),
+                    409 => SandboxesPostResponse::Status409_Conflict(error),
+                    _ => SandboxesPostResponse::Status400_BadRequest(error),
+                });
+            }
+        };
+        // Attached drives take the first free slots, before volumes.
+        let mut extra_drives = attached_drives;
+        extra_drives.extend(volume_drives);
+
+        let request = CreateSandboxRequest {
+            source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
+            extra_drives,
+            extra_drives_in_snapshot,
+            timeout: duration_from_secs(body.timeout),
+            timeout_action: match body.auto_pause {
+                Some(false) => SandboxTimeoutAction::Delete,
+                _ => SandboxTimeoutAction::Pause,
+            },
+            auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),
+            user_metadata: body.metadata.clone(),
+            env_vars: body
+                .env_vars
+                .clone()
+                .filter(|env_vars| !env_vars.is_empty()),
+            network_policy,
+            secure: body.secure == Some(true),
+            custom_extension_params: custom_params,
+            volume_mounts,
+        };
+
+        match timer
+            .time("create_sandbox", self.orchestrator.create_sandbox(request))
+            .await
+        {
+            Ok(metadata) => {
+                if let Err(error) = finish_volume_reservation(
+                    &self.volume_manager,
+                    pending_volume_owner.as_deref(),
+                    Some(metadata.id),
+                    &reserved_volume_ids,
+                )
+                .await
+                {
+                    let _ = self.orchestrator.delete_sandbox(metadata.id).await;
+                    if let Some(owner) = pending_volume_owner.as_deref() {
+                        let _ = self
+                            .volume_manager
+                            .replace_owner_for(owner, None, &reserved_volume_ids)
+                            .await;
+                    }
+                    cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                    return Ok(SandboxesPostResponse::Status500_ServerError(Self::error(
+                        500,
+                        format!("failed to finalize volume reservation: {error}"),
+                    )));
+                }
+                let sandbox_id = metadata.id.to_string();
+                Ok(
+                    SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                        body: self.sandbox_model(metadata),
+                        x_agentenv_sandbox_id: Some(sandbox_id),
+                    },
+                )
+            }
+            Err(err) => {
+                let _ = finish_volume_reservation(
+                    &self.volume_manager,
+                    pending_volume_owner.as_deref(),
+                    None,
+                    &reserved_volume_ids,
+                )
+                .await;
+                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                // The custom extension rejected the start hook with a 4xx
+                // (start-resume for template-based creates).
+                if let Some(message) = hook_client_error_message(&err) {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                        400, message,
+                    )));
+                }
+                Ok(SandboxesPostResponse::Status500_ServerError(
+                    Self::internal_error(&err),
+                ))
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Sandboxes<()> for ApiImpl {
     type Claims = super::Claims;
@@ -1055,184 +1324,18 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewSandbox,
     ) -> Result<SandboxesPostResponse, ()> {
-        let timer = SandboxStageTimer::new("create_warm");
-        let snapshot = match timer
-            .time(
-                "load_snapshot",
-                self.snapshot_manager.load_runnable(&body.template_id),
-            )
-            .await
-        {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => {
-                return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                    400,
-                    format!("template {} not found", body.template_id),
-                )));
-            }
-            Err(err) => {
-                warn!(error = ?err, template_id = %body.template_id, "failed to load runnable snapshot");
-                return Ok(SandboxesPostResponse::Status500_ServerError(
-                    Self::snapshot_manager_error(&err),
-                ));
-            }
-        };
-
-        let network_policy =
-            match network_policy_from_create(body.allow_internet_access, body.network.as_ref()) {
-                Ok(network) => network,
-                Err(err) => {
-                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                        400,
-                        err.to_string(),
-                    )));
-                }
-            };
-
-        let custom_params = body
-            .custom_extension_params
-            .as_ref()
-            .map(params_model_to_map);
-        if let Err(err) = validate_custom_extension_params(custom_params.as_ref()) {
-            return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                400,
-                err.to_string(),
-            )));
-        }
-
-        if let Err(error) = check_snapshot_volume_replacement(
-            &snapshot.committed().volume_snapshots,
-            body.volume_mounts.is_some(),
-        ) {
-            return Ok(SandboxesPostResponse::Status400_BadRequest(error));
-        }
-
-        let extra_drives_in_snapshot =
-            body.volume_mounts.is_none() && !snapshot.committed().volume_snapshots.is_empty();
-        let (requested_volume_mounts, restored_volume_ids) = if let Some(mounts) =
-            body.volume_mounts.as_deref()
-        {
-            let mounts = match volume_mounts_from_model(Some(mounts)) {
-                Ok(mounts) => mounts,
-                Err(error) => {
-                    return Ok(SandboxesPostResponse::Status400_BadRequest(error));
-                }
-            };
-            (mounts, Vec::new())
-        } else {
-            match restore_snapshot_volume_mounts(self, &snapshot).await {
-                Ok((mounts, volume_ids)) => ((!mounts.is_empty()).then_some(mounts), volume_ids),
-                Err(error) => {
-                    return Ok(match error.code {
-                        500 => SandboxesPostResponse::Status500_ServerError(error),
-                        _ => SandboxesPostResponse::Status400_BadRequest(error),
-                    });
-                }
-            }
-        };
-        let PreparedVolumeMounts {
-            owner: pending_volume_owner,
-            drives: volume_drives,
-            mounts: volume_mounts,
-            volume_ids: reserved_volume_ids,
-        } = match prepare_volume_mounts(self, requested_volume_mounts.as_ref()).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                return Ok(match error.code {
-                    500.. => SandboxesPostResponse::Status500_ServerError(error),
-                    409 => SandboxesPostResponse::Status409_Conflict(error),
-                    _ => SandboxesPostResponse::Status400_BadRequest(error),
-                });
-            }
-        };
-
-        let request = CreateSandboxRequest {
-            source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
-            extra_drives: volume_drives,
-            extra_drives_in_snapshot,
-            timeout: duration_from_secs(body.timeout),
-            timeout_action: match body.auto_pause {
-                Some(false) => SandboxTimeoutAction::Delete,
-                _ => SandboxTimeoutAction::Pause,
-            },
-            auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),
-            user_metadata: body.metadata.clone(),
-            env_vars: body
-                .env_vars
-                .clone()
-                .filter(|env_vars| !env_vars.is_empty()),
-            network_policy,
-            secure: body.secure == Some(true),
-            custom_extension_params: custom_params,
-            volume_mounts,
-        };
-
-        match timer
-            .time("create_sandbox", self.orchestrator.create_sandbox(request))
-            .await
-        {
-            Ok(metadata) => {
-                if let Err(error) = finish_volume_reservation(
-                    &self.volume_manager,
-                    pending_volume_owner.as_deref(),
-                    Some(metadata.id),
-                    &reserved_volume_ids,
-                )
-                .await
-                {
-                    let _ = self.orchestrator.delete_sandbox(metadata.id).await;
-                    if let Some(owner) = pending_volume_owner.as_deref() {
-                        let _ = self
-                            .volume_manager
-                            .replace_owner_for(owner, None, &reserved_volume_ids)
-                            .await;
-                    }
-                    cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                    return Ok(SandboxesPostResponse::Status500_ServerError(Self::error(
-                        500,
-                        format!("failed to finalize volume reservation: {error}"),
-                    )));
-                }
-                let sandbox_id = metadata.id.to_string();
-                Ok(
-                    SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
-                        body: self.sandbox_model(metadata),
-                        x_agentenv_sandbox_id: Some(sandbox_id),
-                    },
-                )
-            }
-            Err(err) => {
-                let _ = finish_volume_reservation(
-                    &self.volume_manager,
-                    pending_volume_owner.as_deref(),
-                    None,
-                    &reserved_volume_ids,
-                )
-                .await;
-                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                // The custom extension rejected the start hook with a 4xx
-                // (start-resume for template-based creates).
-                if let Some(message) = hook_client_error_message(&err) {
-                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                        400, message,
-                    )));
-                }
-                Ok(SandboxesPostResponse::Status500_ServerError(
-                    Self::internal_error(&err),
-                ))
-            }
-        }
+        self.create_sandbox_from_snapshot(body, None).await
     }
 
     async fn v2_sandboxes_post(
         &self,
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
         body: &models::NewSandboxV2,
     ) -> Result<V2SandboxesPostResponse, ()> {
+        let attached_drives = body.attached_drives.as_deref();
         let body = models::NewSandbox {
             template_id: body.template_id.clone(),
             timeout: Some(body.timeout.unwrap_or(300)),
@@ -1249,7 +1352,7 @@ impl Sandboxes<()> for ApiImpl {
         };
         Ok(
             match self
-                .sandboxes_post(method, host, cookies, claims, &body)
+                .create_sandbox_from_snapshot(&body, attached_drives)
                 .await?
             {
                 SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
@@ -2295,6 +2398,59 @@ mod tests {
         let error = check_snapshot_volume_replacement(&snapshot_volumes, true)
             .expect_err("explicit mounts must not replace snapshot volumes");
         assert_eq!(error.code, 400);
+    }
+
+    #[test]
+    fn snapshot_attached_drives_require_a_snapshot_without_mounts() {
+        let empty = CommittedSnapshot::mock();
+        let with_volume = CommittedSnapshot {
+            volume_snapshots: vec![SnapshotVolume {
+                mount_path: "/volume".to_string(),
+                mode: VolumeMode::Exclusive,
+                size_mb: 16,
+                layers: Vec::new(),
+            }],
+            ..CommittedSnapshot::mock()
+        };
+        let with_drive = CommittedSnapshot {
+            attached_drives: vec![crate::snapshot::CommittedAttachedDrive::Overlaybd {
+                drive_id: "data".to_string(),
+                layers: Vec::new(),
+                read_only: true,
+                virtual_size: 4096,
+                mount_path: "/mnt/data".into(),
+                sub_path: None,
+            }],
+            ..CommittedSnapshot::mock()
+        };
+
+        assert!(check_snapshot_attached_drives(&empty, true).is_ok());
+        for committed in [&with_volume, &with_drive] {
+            assert!(check_snapshot_attached_drives(committed, false).is_ok());
+            let error = check_snapshot_attached_drives(committed, true)
+                .expect_err("explicit attached drives must not join existing mounts");
+            assert_eq!(error.code, 400);
+        }
+    }
+
+    #[test]
+    fn attached_drive_mount_paths_must_not_overlap_volume_mounts() -> anyhow::Result<()> {
+        let drives = [ExtraDrive::try_new_overlaybd_with_mount_path(
+            "data",
+            "/tmp/image.json",
+            true,
+            "/workspace/data",
+            None::<std::path::PathBuf>,
+        )?];
+        let mounts = |path: &str| HashMap::from([(path.to_string(), "vol_1".to_string())]);
+
+        assert!(check_attached_drive_overlap(&drives, &mounts("/workspace/logs")).is_ok());
+        for path in ["/workspace/data", "/workspace//data/cache", "/workspace"] {
+            let error = check_attached_drive_overlap(&drives, &mounts(path))
+                .expect_err("overlapping mount paths should fail");
+            assert_eq!(error.code, 400);
+        }
+        Ok(())
     }
 
     #[test]

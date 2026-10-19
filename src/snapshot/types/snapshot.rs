@@ -622,6 +622,17 @@ impl RunnableSnapshot {
         snapshot.manifest.volume_drive_slots = 0;
         snapshot
     }
+
+    /// Snapshot whose attached drives all occupy reserved slots.
+    #[cfg(test)]
+    pub(crate) fn from_test_slot_drive_manifest(
+        record: SnapshotRecord,
+        attached_drives: Vec<ResolvedAttachedDrive>,
+    ) -> Self {
+        let mut snapshot = Self::from_test_manifest(record, attached_drives);
+        snapshot.manifest.physical_extra_drive_count = 0;
+        snapshot
+    }
 }
 
 impl fmt::Debug for RunnableSnapshot {

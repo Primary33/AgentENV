@@ -31,6 +31,8 @@ Warm-start options:
 | `<template-or-snapshot>` | Required | Template or snapshot ID or alias. |
 | `--timeout <seconds>` | `300` | Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see [Auto-Eviction](./auto-eviction.md). |
 | `--volume <mount-path>=<volume>` | None | Mount a persistent volume by ID or name. Repeat the option to mount multiple volumes. Not allowed when the snapshot already has volume mounts. |
+| `--image-mount <mount-path>=<image>` | None | Attach a writable drive from an image; see [Attach image drives](#attach-image-drives). Repeatable. Not allowed when the snapshot already has volume mounts or attached drives. |
+| `--image-mount-ro <mount-path>=<image>` | None | Attach a read-only drive from an image. Repeatable. Not allowed when the snapshot already has volume mounts or attached drives. |
 | `-d`, `--detach` | Off | Print the sandbox ID and exit instead of attaching an interactive shell. |
 
 Without `--detach`, `aenv start` waits for the sandbox to become ready and then
@@ -75,6 +77,8 @@ Cold-start options:
 | `--memory <MiB>` | `[machine].mem_size_mib` from your config file | Set sandbox memory. Aliases: `--memory-mb`, `--mem`. |
 | `--disk-size-mb <MiB>` | Source image virtual size | Set root filesystem size. The value must be greater than zero and divisible by 1024 MiB. Alias: `--disk-mb`. |
 | `--volume <mount-path>=<volume>` | None | Mount a persistent volume by ID or name. Repeat the option to mount multiple volumes. |
+| `--image-mount <mount-path>=<image>` | None | Attach a writable drive from an image; see [Attach image drives](#attach-image-drives). Repeatable. |
+| `--image-mount-ro <mount-path>=<image>` | None | Attach a read-only drive from an image. Repeatable. |
 | `-d`, `--detach` | Off | Print the sandbox ID and exit instead of attaching an interactive shell. |
 
 Cold-started sandboxes also use secure sandbox authentication by default.
@@ -92,6 +96,39 @@ default. Shrinking below the source image size requires
 applies only when creating a fresh writable root filesystem, not to read-only
 images, images with an existing upper layer, or snapshot resume. Sandbox
 responses report the effective size as `diskSizeMB`.
+
+## Attach image drives
+
+Warm and cold starts can attach image filesystems as drives at guest paths:
+
+```bash
+aenv start my-template \
+  --image-mount /workspace=aenv/repo:main \
+  --image-mount-ro /mnt/models=aenv/models:v1
+```
+
+The CLI sends these as `attachedDrives` entries, on `POST /v2/sandboxes` for
+warm starts and on `POST /sandboxes-cold` for cold starts. Each entry has a
+`driveID`, a `source.image`, and optional `mountPath`, `subPath`, `readOnly`,
+and `diskSizeMB`. The API defaults `readOnly` to `true`; the CLI sets it to
+`false` for `--image-mount` and derives `driveID` from the mount path, such as
+`image_mnt_models` for `/mnt/models`. The image accepts the same references as
+a cold-start `<image>`.
+
+An attached drive belongs to its sandbox and is removed with it. Writes are not
+kept elsewhere; use a [volume](../volumes/index.md) for data that must outlive
+the sandbox.
+
+| Operation | Attached drives |
+|---|---|
+| Snapshot | Captures each drive's current state into the snapshot. |
+| Launch from a snapshot | Restores the captured drives. Providing `attachedDrives`, including an empty array, is rejected when the snapshot has volume mounts or attached drives. |
+| Fork | Gives each child its own copy of the drive state. |
+| Pause and resume | Keeps the drives and their writes. |
+
+On a warm start, attached drives and new volumes share the snapshot's reserved
+drive slots, so their combined count cannot exceed the slots it has free.
+Snapshots captured before reserved slots existed have none.
 
 ## Build reusable images
 

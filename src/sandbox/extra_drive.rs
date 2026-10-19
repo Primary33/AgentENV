@@ -85,18 +85,20 @@ impl PreparedDrives {
     }
 }
 
+/// Prepares each drive with the mode `mode` returns for its index.
 pub(crate) async fn prepare_extra_drives(
     extra_drives: &[ExtraDrive],
     global_config_path: &Path,
     sandbox_work_dir: &Path,
     runtime_upper_mode: UpperMode,
-    mode: ExtraDrivePrepareMode,
+    mode: impl Fn(usize) -> ExtraDrivePrepareMode,
 ) -> Result<PreparedDrives> {
     let mut mounts = Vec::with_capacity(extra_drives.len());
     let mut cleanup_paths = Vec::with_capacity(extra_drives.len());
     let mut runtimes = Vec::with_capacity(extra_drives.len());
 
-    for drive in extra_drives {
+    for (index, drive) in extra_drives.iter().enumerate() {
+        let mode = mode(index);
         let result = async {
             let runtime_dir = drive.runtime_dir(sandbox_work_dir);
             let (requested_virtual_size, known_source_virtual_size) = mode.device_sizes(drive);

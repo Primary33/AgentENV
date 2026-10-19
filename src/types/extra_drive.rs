@@ -33,11 +33,66 @@ pub enum ExtraDrive {
         /// Optional persistent destination for a volume snapshot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         snapshot_output_dir: Option<PathBuf>,
-        /// Persistent volumes are omitted from committed attached-drive
-        /// manifests and rebound through reserved Firecracker slots.
-        #[serde(default)]
-        volume: bool,
+        #[serde(default, rename = "volume", with = "extra_drive_kind_serde")]
+        kind: ExtraDriveKind,
     },
+}
+
+/// How a drive is attached to Firecracker and whether captures commit it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExtraDriveKind {
+    /// Attached under its own drive ID and committed to snapshot manifests.
+    #[default]
+    Physical,
+    /// Added to a snapshot launch through a reserved slot. Captures commit it
+    /// to the manifest, and it keeps its slot in later launches.
+    LaunchSlot,
+    /// Persistent volume: omitted from committed attached-drive manifests and
+    /// rebound through reserved Firecracker slots.
+    Volume,
+}
+
+/// Physical drives and volumes keep the legacy boolean `volume` field, so
+/// persisted configs stay readable in both directions.
+mod extra_drive_kind_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::ExtraDriveKind;
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Legacy(bool),
+        Named(Named),
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Named {
+        LaunchSlot,
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        kind: &ExtraDriveKind,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match kind {
+            ExtraDriveKind::Physical => Repr::Legacy(false),
+            ExtraDriveKind::LaunchSlot => Repr::Named(Named::LaunchSlot),
+            ExtraDriveKind::Volume => Repr::Legacy(true),
+        }
+        .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ExtraDriveKind, D::Error> {
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Legacy(false) => ExtraDriveKind::Physical,
+            Repr::Named(Named::LaunchSlot) => ExtraDriveKind::LaunchSlot,
+            Repr::Legacy(true) => ExtraDriveKind::Volume,
+        })
+    }
 }
 
 impl ExtraDrive {
@@ -76,7 +131,7 @@ impl ExtraDrive {
             virtual_size: None,
             sub_path,
             snapshot_output_dir: None,
-            volume: false,
+            kind: ExtraDriveKind::Physical,
         })
     }
 
@@ -139,10 +194,27 @@ impl ExtraDrive {
         }
     }
 
-    pub(crate) fn is_volume(&self) -> bool {
+    pub fn kind(&self) -> ExtraDriveKind {
         match self {
-            Self::Overlaybd { volume, .. } => *volume,
+            Self::Overlaybd { kind, .. } => *kind,
         }
+    }
+
+    pub(crate) fn is_volume(&self) -> bool {
+        self.kind() == ExtraDriveKind::Volume
+    }
+
+    /// Whether the drive is bound to a reserved Firecracker slot.
+    pub(crate) fn uses_reserved_slot(&self) -> bool {
+        self.kind() != ExtraDriveKind::Physical
+    }
+
+    pub fn with_kind(&self, kind: ExtraDriveKind) -> Self {
+        let mut drive = self.clone();
+        match &mut drive {
+            Self::Overlaybd { kind: current, .. } => *current = kind,
+        }
+        drive
     }
 
     pub(crate) fn with_volume_snapshot_output_dir(&self, output_dir: Option<PathBuf>) -> Self {
@@ -163,7 +235,7 @@ impl ExtraDrive {
                 virtual_size: *virtual_size,
                 sub_path: sub_path.clone(),
                 snapshot_output_dir: output_dir,
-                volume: true,
+                kind: ExtraDriveKind::Volume,
             },
         }
     }
@@ -177,7 +249,7 @@ impl ExtraDrive {
                 virtual_size,
                 sub_path,
                 snapshot_output_dir,
-                volume,
+                kind,
                 ..
             } => Self::Overlaybd {
                 drive_id: drive_id.clone(),
@@ -187,7 +259,7 @@ impl ExtraDrive {
                 virtual_size: *virtual_size,
                 sub_path: sub_path.clone(),
                 snapshot_output_dir: snapshot_output_dir.clone(),
-                volume: *volume,
+                kind: *kind,
             },
         }
     }
@@ -204,7 +276,7 @@ impl ExtraDrive {
                 read_only,
                 mount_path,
                 snapshot_output_dir,
-                volume,
+                kind,
                 sub_path,
                 ..
             } => Ok(Self::Overlaybd {
@@ -215,7 +287,7 @@ impl ExtraDrive {
                 virtual_size: Some(virtual_size),
                 sub_path: sub_path.clone(),
                 snapshot_output_dir: snapshot_output_dir.clone(),
-                volume: *volume,
+                kind: *kind,
             }),
         }
     }
@@ -384,6 +456,33 @@ mod tests {
 
         assert!(drive.is_volume());
         assert!(drive.snapshot_output_dir().is_none());
+    }
+
+    #[test]
+    fn drive_kind_keeps_legacy_volume_field() {
+        let drive = ExtraDrive::try_new_overlaybd("data", "/tmp/image.json", false)
+            .expect("drive should parse");
+        for (kind, encoded) in [
+            (ExtraDriveKind::Physical, serde_json::json!(false)),
+            (ExtraDriveKind::LaunchSlot, serde_json::json!("launch_slot")),
+            (ExtraDriveKind::Volume, serde_json::json!(true)),
+        ] {
+            let drive = drive.with_kind(kind);
+            let value = serde_json::to_value(&drive).expect("drive should serialize");
+            assert_eq!(value["Overlaybd"]["volume"], encoded);
+            let decoded: ExtraDrive =
+                serde_json::from_value(value).expect("drive should deserialize");
+            assert_eq!(decoded, drive);
+        }
+
+        let mut legacy = serde_json::to_value(&drive).expect("drive should serialize");
+        legacy["Overlaybd"]
+            .as_object_mut()
+            .expect("drive fields")
+            .remove("volume");
+        let decoded: ExtraDrive =
+            serde_json::from_value(legacy).expect("drive without kind should deserialize");
+        assert_eq!(decoded.kind(), ExtraDriveKind::Physical);
     }
 
     #[test]

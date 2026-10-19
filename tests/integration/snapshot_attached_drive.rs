@@ -6,8 +6,8 @@ use crate::common;
 
 use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{
-    ExtraDrive, FirecrackerSandbox, FirecrackerSandboxConfig, OverlaybdConfig, SandboxBackend,
-    SandboxExecutor, SandboxLaunchConfig,
+    ExtraDrive, ExtraDriveKind, FirecrackerSandbox, FirecrackerSandboxConfig, OverlaybdConfig,
+    SandboxBackend, SandboxExecutor, SandboxLaunchConfig,
 };
 use agentenv::snapshot::{
     CommittedAttachedDrive, OverlaybdLayerRef, SnapshotAlias, SnapshotId, SnapshotManager,
@@ -131,13 +131,7 @@ async fn assert_snapshot_attached_drive_is_visible(
     Ok(())
 }
 
-async fn publish_sandbox_snapshot_with_attached_drive(
-    snapshot_manager: &SnapshotManager,
-    alias: &str,
-    image_config: &Path,
-    read_only: bool,
-    setup_cmd: &str,
-) -> Result<SnapshotRecord> {
+fn small_sandbox_config(image_config: &Path) -> Result<FirecrackerSandboxConfig> {
     let user_image = OverlaybdConfig {
         image_config_path: image_config.to_path_buf(),
         read_only: false,
@@ -146,6 +140,17 @@ async fn publish_sandbox_snapshot_with_attached_drive(
     let mut config = FirecrackerSandboxConfig::from_global_config_with_user_image(user_image)?;
     config.vcpu_count = 1;
     config.mem_size_mib = 128;
+    Ok(config)
+}
+
+async fn publish_sandbox_snapshot_with_attached_drive(
+    snapshot_manager: &SnapshotManager,
+    alias: &str,
+    image_config: &Path,
+    read_only: bool,
+    setup_cmd: &str,
+) -> Result<SnapshotRecord> {
+    let mut config = small_sandbox_config(image_config)?;
     config.common.extra_drives = vec![ExtraDrive::try_new_overlaybd(
         "data",
         image_config.to_path_buf(),
@@ -161,7 +166,14 @@ async fn publish_sandbox_snapshot_with_attached_drive(
 
     let captured = SandboxBackend::snapshot(&mut sandbox).await?;
     sandbox.stop().await?;
+    publish_capture(snapshot_manager, alias, captured).await
+}
 
+async fn publish_capture(
+    snapshot_manager: &SnapshotManager,
+    alias: &str,
+    captured: agentenv::sandbox::CapturedSandboxSnapshot,
+) -> Result<SnapshotRecord> {
     let metadata = SnapshotPublishMetadata {
         id: SnapshotId::generate(),
         alias: Some(SnapshotAlias::parse(alias)?),
@@ -218,7 +230,7 @@ async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
             virtual_size: Some(1024 * 1024 * 1024),
             sub_path: None,
             snapshot_output_dir: Some(image_config.parent().unwrap().to_path_buf()),
-            volume: true,
+            kind: ExtraDriveKind::Volume,
         });
     }
     let mut worker = FirecrackerSandbox::new(config.clone())?;
@@ -496,6 +508,115 @@ async fn writable_attached_overlaybd_drive_preserves_metadata_and_mount_mode() -
     assert_snapshot_attached_drive_is_visible(&sandbox, "data", false).await?;
     sandbox.stop().await?;
 
+    Ok(())
+}
+
+async fn assert_guest_files(sandbox: &FirecrackerSandbox, files: &[&str]) -> Result<()> {
+    for file in files {
+        let output = sandbox
+            .run_command("cat", &[&format!("/mnt/data/{file}")])
+            .await?;
+        anyhow::ensure!(
+            output.exit_code == 0 && output.stdout.trim() == *file,
+            "unexpected /mnt/data/{file}: {output:?}"
+        );
+    }
+    Ok(())
+}
+
+async fn write_guest_file(sandbox: &FirecrackerSandbox, file: &str) -> Result<()> {
+    let output = sandbox
+        .run_command(
+            "sh",
+            &["-lc", &format!("echo {file} > /mnt/data/{file} && sync")],
+        )
+        .await?;
+    anyhow::ensure!(output.exit_code == 0, "{}", output.stderr);
+    Ok(())
+}
+
+/// A drive added to a snapshot launch keeps its reserved slot through
+/// capture, relaunch, fork, and a second capture.
+#[tokio::test]
+async fn launch_time_attached_drive_keeps_its_slot_across_captures() -> Result<()> {
+    common::setup().await;
+    let store = tempdir()?;
+    let (_, snapshot_manager) = test_parts(store.path());
+    let (_, image_config) = common::default_rootfs_template_build_spec_with_image_config();
+
+    let mut base = FirecrackerSandbox::new(small_sandbox_config(&image_config)?)?;
+    base.start().await?;
+    let captured = SandboxBackend::snapshot(&mut base).await?;
+    base.stop().await?;
+    let base_alias = unique_alias_for_test("launch_drive_base");
+    publish_capture(&snapshot_manager, &base_alias, captured).await?;
+
+    let runnable = snapshot_manager
+        .load_runnable(&base_alias)
+        .await?
+        .ok_or_else(|| anyhow!("base snapshot should exist"))?;
+    let launch_config = SandboxLaunchConfig {
+        extra_drives: vec![
+            ExtraDrive::try_new_overlaybd("data", image_config.clone(), false)?
+                .with_kind(ExtraDriveKind::LaunchSlot),
+        ],
+        ..SandboxLaunchConfig::default()
+    };
+    let mut first = FirecrackerSandbox::from_snapshot(&runnable, &launch_config)?;
+    first.start().await?;
+    assert_snapshot_attached_drive_is_visible(&first, "data", false).await?;
+    write_guest_file(&first, "first").await?;
+    let captured = SandboxBackend::snapshot(&mut first).await?;
+    first.stop().await?;
+    let first_alias = unique_alias_for_test("launch_drive_first");
+    publish_capture(&snapshot_manager, &first_alias, captured).await?;
+
+    let runnable = snapshot_manager
+        .load_runnable(&first_alias)
+        .await?
+        .ok_or_else(|| anyhow!("first snapshot should exist"))?;
+    let manifest = runnable.manifest();
+    assert_eq!(manifest.attached_drives.len(), 1);
+    assert_eq!(manifest.effective_physical_extra_drive_count(), 0);
+    assert_eq!(manifest.free_drive_slots() + 1, manifest.volume_drive_slots);
+
+    let mut second = FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default())?;
+    second.start().await?;
+    let second_result: Result<()> = async {
+        assert_snapshot_attached_drive_is_visible(&second, "data", false).await?;
+        assert_guest_files(&second, &["first"]).await?;
+        write_guest_file(&second, "second").await?;
+
+        // A fork child resumes from the paused state while its parent runs on.
+        let paused = second.pause().await?;
+        second.resume().await?;
+        let mut child = FirecrackerSandbox::resume_from_snapshot_config(&paused).await?;
+        let child_result = assert_guest_files(&child, &["first", "second"]).await;
+        child.stop().await?;
+        child_result?;
+
+        let captured = SandboxBackend::snapshot(&mut second).await?;
+        let second_alias = unique_alias_for_test("launch_drive_second");
+        publish_capture(&snapshot_manager, &second_alias, captured).await?;
+        let runnable = snapshot_manager
+            .load_runnable(&second_alias)
+            .await?
+            .ok_or_else(|| anyhow!("second snapshot should exist"))?;
+        assert_eq!(
+            runnable.manifest().effective_physical_extra_drive_count(),
+            0
+        );
+        let mut third =
+            FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default())?;
+        third.start().await?;
+        let third_result = assert_guest_files(&third, &["first", "second"]).await;
+        third.stop().await?;
+        third_result
+    }
+    .await;
+    let second_stop = second.stop().await;
+    second_result?;
+    second_stop?;
     Ok(())
 }
 

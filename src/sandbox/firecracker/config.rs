@@ -529,13 +529,7 @@ impl FirecrackerSnapshotConfig {
         // is already serialised inside vm_state.bin, so re-applying a template would
         // be incorrect and is rejected by Firecracker anyway.
         let extra_drives = manifest.extra_drives();
-        let physical_extra_drive_count = if manifest.volume_drive_slots == 0 {
-            // Snapshots created before reserved volume slots existed contain
-            // only physical attached drives.
-            extra_drives.len()
-        } else {
-            manifest.physical_extra_drive_count
-        };
+        let physical_extra_drive_count = manifest.effective_physical_extra_drive_count();
         let snapshot_common = FirecrackerCommonConfig {
             ublk_config: Some(overlaybd_ublk_config),
             envd_version: snapshot.committed().runtime_versions.envd_version.clone(),
@@ -678,6 +672,7 @@ mod tests {
     use super::*;
     use crate::cfg::{UblkOverlaybdTomlConfig, UblkTomlConfig};
     use crate::snapshot::{CommittedSnapshot, ResolvedAttachedDrive, SnapshotRecord};
+    use crate::types::ExtraDriveKind;
     use std::fs;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
@@ -812,7 +807,7 @@ mod tests {
                 virtual_size: None,
                 sub_path: None,
                 snapshot_output_dir: None,
-                volume: false,
+                kind: ExtraDriveKind::Physical,
             },
             ExtraDrive::Overlaybd {
                 drive_id: "data".to_string(),
@@ -822,7 +817,7 @@ mod tests {
                 virtual_size: None,
                 sub_path: None,
                 snapshot_output_dir: None,
-                volume: false,
+                kind: ExtraDriveKind::Physical,
             },
         ];
 
@@ -856,7 +851,7 @@ mod tests {
                     virtual_size: None,
                     sub_path: None,
                     snapshot_output_dir: None,
-                    volume: false,
+                    kind: ExtraDriveKind::Physical,
                 }
             })
             .collect();
@@ -958,6 +953,39 @@ mod tests {
 
         assert_eq!(config.common.physical_extra_drive_count, 1);
         assert_eq!(config.common.volume_drive_slots, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn runnable_snapshot_keeps_committed_slot_drives_in_slots() -> Result<()> {
+        let drive = ResolvedAttachedDrive::Overlaybd {
+            drive_id: "data".to_owned(),
+            image_config_path: "/tmp/data.json".into(),
+            read_only: false,
+            virtual_size: 4096,
+            mount_path: ExtraDrive::default_mount_path("data"),
+            sub_path: None,
+        };
+        let snapshot = RunnableSnapshot::from_test_slot_drive_manifest(
+            SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
+            vec![drive],
+        );
+
+        let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
+
+        assert_eq!(config.common.physical_extra_drive_count, 0);
+        assert_eq!(
+            config.common.volume_drive_slots,
+            snapshot.manifest().volume_drive_slots
+        );
+        assert_eq!(
+            config.common.extra_drives[0].kind(),
+            ExtraDriveKind::LaunchSlot
+        );
+        assert_eq!(
+            snapshot.manifest().free_drive_slots(),
+            snapshot.manifest().volume_drive_slots - 1
+        );
         Ok(())
     }
 
