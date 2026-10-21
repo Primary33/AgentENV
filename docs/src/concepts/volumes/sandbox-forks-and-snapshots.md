@@ -29,3 +29,9 @@ exclusive; a read-only volume remains read-only.
 Volume snapshots are independent from their source volumes. Deleting a source
 volume does not remove volume data already committed into a sandbox snapshot.
 
+
+An explicit `volumeMounts` array on snapshot launch replaces all captured
+volume mounts; an empty array removes them. Replacement returns HTTP 409 if
+the guest cannot release an old filesystem, for example because a captured
+process keeps an open file or its working directory on a volume. Close those
+references before capturing a template intended for mount replacement.

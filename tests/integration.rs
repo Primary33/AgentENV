@@ -15,6 +15,9 @@ mod snapshot;
 #[path = "integration/snapshot_attached_drive.rs"]
 mod snapshot_attached_drive;
 
+#[path = "integration/volume_replacement.rs"]
+mod volume_replacement;
+
 #[path = "integration/posix_startup_pack.rs"]
 mod posix_startup_pack;
 

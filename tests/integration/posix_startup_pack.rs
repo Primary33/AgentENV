@@ -121,6 +121,7 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
             extra_mmds: serde_json::Map::new(),
             extra_drives: Vec::new(),
             extra_drives_in_snapshot: false,
+            replaced_snapshot_drives: Vec::new(),
             custom_extension_params: None,
             envd_access_token: None,
         };

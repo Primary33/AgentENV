@@ -475,6 +475,7 @@ where
             volume_mounts,
             extra_drives: launch_extra_drives,
             extra_drives_in_snapshot,
+            replaced_snapshot_drives,
         } = request;
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
         info!(timeout = ?timeout, "creating sandbox");
@@ -514,6 +515,7 @@ where
                     envd_access_token: envd_access_token.clone(),
                     extra_drives: launch_extra_drives.clone(),
                     extra_drives_in_snapshot,
+                    replaced_snapshot_drives,
                 };
 
                 let transitional_metadata = SandboxMetadata {
@@ -573,6 +575,7 @@ where
                     envd_access_token,
                     extra_drives: Vec::new(),
                     extra_drives_in_snapshot: false,
+                    replaced_snapshot_drives: Vec::new(),
                 };
                 let build_spec = FreshSandboxBuildSpec {
                     image_config_path: overlaybd_config_path,

@@ -685,6 +685,10 @@ components:
         mcp:
           $ref: "#/components/schemas/Mcp"
         volumeMounts:
+          description: >-
+            Explicit values replace all snapshot volume mounts; an empty array
+            removes them all. Omit to restore the snapshot mounts. Returns 409
+            if a snapshot filesystem is still in use by a guest process.
           type: array
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
@@ -727,6 +731,10 @@ components:
         mcp:
           $ref: "#/components/schemas/Mcp"
         volumeMounts:
+          description: >-
+            Explicit values replace all snapshot volume mounts; an empty array
+            removes them all. Omit to restore the snapshot mounts. Returns 409
+            if a snapshot filesystem is still in use by a guest process.
           type: array
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
@@ -1715,6 +1723,8 @@ paths:
     post:
       summary: Create sandbox
       description: >
+        Explicit volumeMounts replace all snapshot mounts. Returns 409 if an
+        old filesystem is still in use by a guest process and cannot be released.
         Create a sandbox from an existing template/snapshot. Use POST /v2/sandboxes instead or
         POST /sandboxes-cold to create a sandbox directly from an external OCI
         image.
@@ -1869,6 +1879,8 @@ paths:
     post:
       summary: Create sandbox (v2)
       description: Create a sandbox from the template. All system communication with the sandbox is secured.
+        Explicit volumeMounts replace all snapshot mounts. Returns 409 if an
+        old filesystem is still in use by a guest process and cannot be released.
       tags: [sandboxes]
       security:
         - ApiKeyAuth: []

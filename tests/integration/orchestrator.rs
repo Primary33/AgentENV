@@ -78,6 +78,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
             source: SandboxLaunchSource::Snapshot(Box::new(runnable)),
             extra_drives: Vec::new(),
             extra_drives_in_snapshot: false,
+            replaced_snapshot_drives: Vec::new(),
             timeout: Some(Duration::from_secs(30)),
             timeout_action: SandboxTimeoutAction::Pause,
             user_metadata: Some(
@@ -247,6 +248,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 source: SandboxLaunchSource::Snapshot(Box::new(runnable)),
                 extra_drives: Vec::new(),
                 extra_drives_in_snapshot: false,
+                replaced_snapshot_drives: Vec::new(),
                 timeout: Some(Duration::from_secs(30)),
                 timeout_action: SandboxTimeoutAction::Pause,
                 user_metadata: Some(std::collections::HashMap::from([(
@@ -353,6 +355,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 source: SandboxLaunchSource::Snapshot(Box::new(captured_runnable)),
                 extra_drives: Vec::new(),
                 extra_drives_in_snapshot: false,
+                replaced_snapshot_drives: Vec::new(),
                 timeout: Some(Duration::from_secs(30)),
                 timeout_action: SandboxTimeoutAction::Pause,
                 user_metadata: None,

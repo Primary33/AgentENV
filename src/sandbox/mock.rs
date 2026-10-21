@@ -76,11 +76,16 @@ pub struct MockBehavior {
     runtime_info: Mutex<SandboxRuntimeInfo>,
     envd: Mutex<Option<Arc<dyn super::EnvdApi>>>,
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
+    launch_config: Mutex<Option<SandboxLaunchConfig>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
 }
 
 impl MockBehavior {
+    pub fn launch_config(&self) -> Option<SandboxLaunchConfig> {
+        self.launch_config.lock().unwrap().clone()
+    }
+
     pub fn set_envd(&self, envd: Arc<dyn super::EnvdApi>) {
         *self.envd.lock().unwrap() = Some(envd);
     }
@@ -469,8 +474,9 @@ impl SandboxBackendFactory for MockBackendFactory {
     fn build_from_snapshot(
         &self,
         _snapshot: &RunnableSnapshot,
-        _launch_config: SandboxLaunchConfig,
+        launch_config: SandboxLaunchConfig,
     ) -> Result<Box<dyn SandboxBackend>> {
+        *self.behavior.launch_config.lock().unwrap() = Some(launch_config);
         self.behavior.apply_sync(MockOperation::Build)?;
         Ok(Box::new(MockSandboxBackend::new_with_host_ip(
             Arc::clone(&self.behavior),

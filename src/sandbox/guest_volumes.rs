@@ -1,12 +1,112 @@
 //! Guest-side volume filesystem operations run through envd.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::process::Executor;
 use crate::types::ExtraDrive;
+
+#[derive(Debug, thiserror::Error)]
+#[error("snapshot mount {mount_path} cannot be released: {detail}")]
+pub struct SnapshotMountBusy {
+    pub mount_path: PathBuf,
+    pub detail: String,
+}
+
+pub(super) fn guest_device_name(index: usize) -> String {
+    format!("vd{}", char::from(b'c' + index as u8))
+}
+
+pub(super) async fn release_snapshot_mounts(
+    envd: EnvdInstance,
+    mut mounts: Vec<(usize, PathBuf)>,
+) -> Result<()> {
+    if mounts.is_empty() {
+        return Ok(());
+    }
+    mounts.sort_by_key(|(_, path)| std::cmp::Reverse(path.components().count()));
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(release_snapshot_mounts_inner(envd, mounts))
+    })
+    .await
+    .context("snapshot mount release task failed")?
+}
+
+async fn release_snapshot_mounts_inner(
+    envd: EnvdInstance,
+    mounts: Vec<(usize, PathBuf)>,
+) -> Result<()> {
+    let entries = mounts
+        .iter()
+        .map(|(index, path)| format!("{}:{}", guest_device_name(*index), path.display()))
+        .collect::<Vec<_>>();
+    let script = r#"
+        set -eu
+        fail() {
+            printf '%s\n' "$entry"
+            printf '%s\n' "$1" >&2
+            exit 1
+        }
+        for entry in "$@"; do
+            /agentenv/bin/busybox umount "${entry#*:}" || fail 'non-lazy umount failed'
+        done
+        for entry in "$@"; do
+            dev=${entry%%:*}
+            majmin=$(/agentenv/bin/busybox cat "/sys/block/$dev/dev") || fail 'cannot read device number'
+            test ! -e "/sys/fs/ext4/$dev" || fail 'ext4 superblock is still active'
+            for info in /proc/[0-9]*/mountinfo; do
+                # Check the device column, including other mount namespaces.
+                # Do not accept unreadable mountinfo as proof of release. Only
+                # disappearing processes can be skipped during this scan.
+                status=0
+                /agentenv/bin/busybox awk -v dev="$majmin" \
+                    '$3 == dev { found=1 } END { exit (found ? 42 : 0) }' "$info" || status=$?
+                case "$status" in
+                    0) ;;
+                    42) fail "device is still mounted in $info" ;;
+                    *) test ! -e "$info" || fail "cannot inspect $info" ;;
+                esac
+            done
+        done
+    "#;
+    let mut args = vec!["sh", "-c", script, "release-snapshot-mounts"];
+    args.extend(entries.iter().map(String::as_str));
+    let timeout = std::time::Duration::from_secs(30);
+    let output = tokio::time::timeout(
+        timeout,
+        Executor::new(envd).with_root_user().run_command_with_opts(
+            "/agentenv/bin/busybox",
+            &args,
+            &crate::sandbox::ProcessOpts::default()
+                .with_cwd("/")
+                .with_timeout(timeout),
+        ),
+    )
+    .await;
+    let (entry, detail) = match output {
+        Ok(Ok(output)) if output.exit_code == 0 => return Ok(()),
+        Ok(Ok(output)) => (
+            Some(output.stdout.trim().to_owned()),
+            output.stderr.trim().to_owned(),
+        ),
+        Ok(Err(error)) => (None, format!("guest release command failed: {error:#}")),
+        Err(_) => (
+            None,
+            "guest release command timed out after 30 seconds".to_owned(),
+        ),
+    };
+    let index = entry
+        .as_ref()
+        .and_then(|entry| entries.iter().position(|value| value == entry))
+        .unwrap_or(0);
+    Err(SnapshotMountBusy {
+        mount_path: mounts[index].1.clone(),
+        detail,
+    }
+    .into())
+}
 
 pub(super) async fn mount_initial_guest_drives(
     envd: EnvdInstance,
@@ -25,7 +125,7 @@ async fn mount_initial_guest_drives_inner(
     drives: Vec<(usize, ExtraDrive)>,
 ) -> Result<()> {
     for (index, drive) in &drives {
-        let device = format!("/dev/vd{}", char::from(b'c' + *index as u8));
+        let device = format!("/dev/{}", guest_device_name(*index));
         let target = drive.mount_path().to_string_lossy().into_owned();
         create_guest_directory(&envd, &target).await?;
         let mount_options = if drive.read_only() {

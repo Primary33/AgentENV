@@ -47,6 +47,15 @@ curl -H 'X-API-Key: test-key' \
   http://127.0.0.1:8000/sandboxes/<sandbox-id>
 ```
 
+When starting from a snapshot with volumes, omitting `volumeMounts` restores
+all captured mounts. An explicit array replaces the complete set, including
+mount paths and access modes; `[]` removes all snapshot volume mounts.
+Before reusing a drive slot, AgentENV unmounts its old filesystem and verifies
+that the guest has released it. If a guest process still holds it, creation
+returns HTTP 409. Before capturing a reusable template, close files and move
+process working directories off its volumes. Existing templates with such
+processes must be recaptured before their mounts can be replaced.
+
 ## Cold Start from an OCI Image
 
 A cold start resolves an OCI image directly and prepares a fresh writable root filesystem at runtime:

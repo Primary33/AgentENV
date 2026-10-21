@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -160,9 +160,16 @@ pub(super) fn managed_snapshot_base() -> PathBuf {
 }
 
 const VOLUME_DRIVE_PLACEHOLDER_SIZE: u64 = 4096;
+const STAGED_SNAPSHOT_DRIVES_DIR: &str = "staged-snapshot-drives";
 
 fn volume_drive_slot_id(index: usize) -> String {
     format!("{VOLUME_DRIVE_SLOT_PREFIX}{index}")
+}
+
+struct VolumeSwap {
+    slots: Vec<DriveMount>,
+    new_drives: Vec<DriveMount>,
+    old_mounts: Vec<(usize, PathBuf)>,
 }
 
 // ── FirecrackerSandbox ───────────────────────────────────────────────────────
@@ -189,6 +196,8 @@ pub struct FirecrackerSandbox {
     /// in its guest mount namespace. Mount only those drives after envd is
     /// ready; paused-state resumes must preserve the captured mount state.
     initial_guest_drive_mounts: Vec<(usize, ExtraDrive)>,
+    replaced_snapshot_drives: Vec<ExtraDrive>,
+    pending_volume_swap: Mutex<Option<VolumeSwap>>,
     current_rootfs_virtual_size: Option<u64>,
     live_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
 }
@@ -576,9 +585,13 @@ impl SandboxBackend for FirecrackerSandbox {
             LaunchMode::Fresh(config) => &config.common,
             LaunchMode::Resume(config) => &config.common,
         };
-        RuntimeArtifactSet::from_overlaybd_image_configs(rootfs_and_extra_drive_image_config_paths(
-            common,
-        ))
+        let mut paths = rootfs_and_extra_drive_image_config_paths(common);
+        paths.extend(
+            self.replaced_snapshot_drives
+                .iter()
+                .map(|drive| drive.image_config_path().to_path_buf()),
+        );
+        RuntimeArtifactSet::from_overlaybd_image_configs(paths)
     }
 
     async fn update_network_policy(&mut self, policy: Option<SandboxNetworkPolicy>) -> Result<()> {
@@ -753,6 +766,16 @@ impl FirecrackerSandbox {
         launch_config: &SandboxLaunchConfig,
     ) -> Result<Self> {
         let snapshot_config = Self::snapshot_config_for_launch(snapshot, launch_config)?;
+        anyhow::ensure!(
+            launch_config.replaced_snapshot_drives.is_empty()
+                || !launch_config.extra_drives_in_snapshot,
+            "replacement snapshot drives require extra_drives_in_snapshot=false"
+        );
+        anyhow::ensure!(
+            launch_config.replaced_snapshot_drives.len()
+                <= snapshot_config.common.volume_drive_slots,
+            "snapshot has more replacement backing drives than reserved volume slots"
+        );
         let initial_guest_drive_mounts =
             Self::initial_guest_drive_mounts_for_snapshot_launch(&snapshot_config, launch_config);
         let mut sandbox = Self::build(
@@ -760,6 +783,7 @@ impl FirecrackerSandbox {
             LaunchMode::Resume(snapshot_config),
         )?;
         sandbox.initial_guest_drive_mounts = initial_guest_drive_mounts;
+        sandbox.replaced_snapshot_drives = launch_config.replaced_snapshot_drives.clone();
         Ok(sandbox)
     }
 
@@ -907,6 +931,44 @@ impl FirecrackerSandbox {
                 self.launch.common().default_user.clone(),
             )
             .await?;
+
+        let swap = self.pending_volume_swap.lock().unwrap().take();
+        if let Some(swap) = swap {
+            guest_volumes::release_snapshot_mounts(envd_instance.clone(), swap.old_mounts).await?;
+            for (index, slot) in swap.slots.iter().enumerate() {
+                if let Some(drive) = swap.new_drives.get(index) {
+                    self.bind_volume_drive_slot(slot, drive)?;
+                } else {
+                    self.reset_volume_drive_slot(slot)?;
+                }
+                self.fc_instance
+                    .patch_drive_path(&slot.drive_id, &slot.attachment_path)
+                    .await
+                    .with_context(|| format!("replace snapshot volume slot {}", slot.drive_id))?;
+            }
+            loop {
+                let runtime = self
+                    .resources
+                    .staged_drive_runtimes
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .cloned();
+                let Some(runtime) = runtime else { break };
+                UblkDeviceManager::global()
+                    .release_device(&runtime.device)
+                    .await?;
+                self.resources.staged_drive_runtimes.lock().unwrap().pop();
+            }
+            for drive in &self.replaced_snapshot_drives {
+                fs::remove_file(
+                    self.work_dir
+                        .path()
+                        .join(STAGED_SNAPSHOT_DRIVES_DIR)
+                        .join(drive.attachment_symlink_name()),
+                )?;
+            }
+        }
 
         // The snapshot already carries mount state for its existing drives.
         // Only drives newly supplied for this launch need a guest-side mount.
@@ -1362,8 +1424,11 @@ fn build_drives_boot_arg(extra_drives: &[ExtraDrive]) -> Option<String> {
         .iter()
         .enumerate()
         .map(|(i, drive)| {
-            let dev_letter = (b'c' + i as u8) as char;
-            let mut entry = format!("vd{}:{}", dev_letter, drive.mount_path().display());
+            let mut entry = format!(
+                "{}:{}",
+                guest_volumes::guest_device_name(i),
+                drive.mount_path().display()
+            );
             if let Some(sub_path) = drive.sub_path() {
                 entry.push(':');
                 entry.push_str(&sub_path.display().to_string());
@@ -1469,6 +1534,8 @@ impl FirecrackerSandbox {
             envd_instance: None,
             frozen_volume_mounts: Vec::new(),
             initial_guest_drive_mounts: Vec::new(),
+            replaced_snapshot_drives: Vec::new(),
+            pending_volume_swap: Mutex::new(None),
             live_snapshot_root: None,
         })
     }
@@ -1830,6 +1897,33 @@ impl FirecrackerSandbox {
             volume_drive_attachments.len() <= volume_slots.len(),
             "snapshot has more launch-time drives than reserved volume slots"
         );
+        if !self.replaced_snapshot_drives.is_empty() {
+            let global_config = ConfigManager::global_config();
+            // Keep staging names separate from user-controlled attached-drive ids.
+            let staged_dir = self.work_dir.path().join(STAGED_SNAPSHOT_DRIVES_DIR);
+            fs::create_dir_all(&staged_dir)?;
+            let prepared = prepare_extra_drives(
+                &self.replaced_snapshot_drives,
+                &global_config.ublk.overlaybd.global_config_path,
+                &staged_dir,
+                global_config.ublk.overlaybd.runtime_upper_mode,
+                ExtraDrivePrepareMode::Resume,
+            )
+            .await
+            .context("prepare old snapshot volume backing before replacement")?;
+            let (mut staged_mounts, staged_runtimes) = prepared.into_parts();
+            *self.resources.staged_drive_runtimes.get_mut().unwrap() = staged_runtimes;
+            for drive in &mut staged_mounts {
+                drive.attachment_path =
+                    PathBuf::from(STAGED_SNAPSHOT_DRIVES_DIR).join(&drive.attachment_path);
+            }
+            self.prepare_volume_swap(
+                volume_slots,
+                volume_drive_attachments.to_vec(),
+                &staged_mounts,
+            )?;
+            return Ok(Vec::new());
+        }
         let volume_binds = volume_slots
             .into_iter()
             .zip(volume_drive_attachments.iter().cloned())
@@ -1846,6 +1940,32 @@ impl FirecrackerSandbox {
             })?;
         }
         Ok(Vec::new())
+    }
+
+    fn prepare_volume_swap(
+        &mut self,
+        mut slots: Vec<DriveMount>,
+        new_drives: Vec<DriveMount>,
+        staged_mounts: &[DriveMount],
+    ) -> Result<()> {
+        let physical_count = self.launch.common().physical_extra_drive_count;
+        for (slot, drive) in slots.iter().zip(staged_mounts) {
+            self.bind_volume_drive_slot(slot, drive)?;
+        }
+        // Also patch slots newly occupied by this launch; reset only slots which
+        // used to hold an old filesystem and are no longer needed.
+        slots.truncate(staged_mounts.len().max(new_drives.len()));
+        *self.pending_volume_swap.get_mut().unwrap() = Some(VolumeSwap {
+            slots,
+            new_drives,
+            old_mounts: self
+                .replaced_snapshot_drives
+                .iter()
+                .enumerate()
+                .map(|(index, drive)| (physical_count + index, drive.mount_path().to_path_buf()))
+                .collect(),
+        });
+        Ok(())
     }
 
     /// A volume absent from the source state was loaded as a placeholder.
@@ -2298,6 +2418,18 @@ impl FirecrackerSandbox {
         })
     }
 
+    fn reset_volume_drive_slot(&self, slot: &DriveMount) -> Result<()> {
+        let path = self.work_dir.path().join(&slot.attachment_path);
+        fs::remove_file(&path)
+            .with_context(|| format!("remove old snapshot volume slot {}", path.display()))?;
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)?;
+        file.set_len(VOLUME_DRIVE_PLACEHOLDER_SIZE)?;
+        Ok(())
+    }
+
     async fn prepare_snapshot_backing_drives(
         &mut self,
         extra_drives: &[ExtraDrive],
@@ -2427,6 +2559,14 @@ impl FirecrackerSandbox {
         paths.extend(
             self.resources
                 .extra_drive_runtimes
+                .iter()
+                .map(|runtime| runtime.image_config_path.clone()),
+        );
+        paths.extend(
+            self.resources
+                .staged_drive_runtimes
+                .lock()
+                .unwrap()
                 .iter()
                 .map(|runtime| runtime.image_config_path.clone()),
         );
@@ -2811,6 +2951,98 @@ mod tests {
         assert_eq!(common.physical_extra_drive_count, 1);
         assert!(common.volume_drive_slots >= 1);
         assert_eq!(common.extra_drives, vec![physical_drive, volume_drive]);
+        Ok(())
+    }
+
+    #[test]
+    fn from_snapshot_rejects_inconsistent_replacement_backing() -> Result<()> {
+        let snapshot = RunnableSnapshot::mock();
+        let staged = ExtraDrive::try_new_overlaybd("staged_0", "/tmp/old.json", false)?;
+        let config = SandboxLaunchConfig {
+            extra_drives_in_snapshot: true,
+            replaced_snapshot_drives: vec![staged.clone()],
+            ..Default::default()
+        };
+        let error = FirecrackerSandbox::from_snapshot(&snapshot, &config)
+            .err()
+            .expect("reject restored and replacement drives together");
+        assert!(error.to_string().contains("extra_drives_in_snapshot=false"));
+        let config = SandboxLaunchConfig {
+            replaced_snapshot_drives: vec![staged; snapshot.manifest().volume_drive_slots + 1],
+            ..Default::default()
+        };
+        let error = FirecrackerSandbox::from_snapshot(&snapshot, &config)
+            .err()
+            .expect("reject more old drives than slots");
+        assert!(error
+            .to_string()
+            .contains("more replacement backing drives"));
+        Ok(())
+    }
+
+    #[test]
+    fn volume_swap_binds_old_backing_and_tracks_empty_fewer_and_more_new_drives() -> Result<()> {
+        for new_count in [0, 1, 3] {
+            let work_base = TempDir::new()?;
+            let mut config = fresh_config();
+            config.common.firecracker_work_base_dir = Some(work_base.path().to_path_buf());
+            config.common.extra_drives = vec![ExtraDrive::try_new_overlaybd(
+                "physical",
+                "/tmp/p.json",
+                true,
+            )?];
+            let mut sandbox = FirecrackerSandbox::new(config)?;
+            sandbox.replaced_snapshot_drives = ["/data", "/models"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, path)| {
+                    ExtraDrive::try_new_overlaybd_with_mount_path(
+                        format!("staged_{i}"),
+                        "/tmp/old.json",
+                        false,
+                        path,
+                        None::<PathBuf>,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let slots = sandbox.prepare_volume_drive_slots(1, 3)?;
+            let staged = (0..2)
+                .map(|index| DriveMount {
+                    drive_id: format!("staged_{index}"),
+                    attachment_path: PathBuf::from(format!("old-{index}")),
+                    read_only: false,
+                })
+                .collect::<Vec<_>>();
+            let new_drives = (0..new_count)
+                .map(|index| DriveMount {
+                    drive_id: format!("new-{index}"),
+                    attachment_path: PathBuf::from(format!("new-{index}")),
+                    read_only: false,
+                })
+                .collect::<Vec<_>>();
+            sandbox.prepare_volume_swap(slots, new_drives, &staged)?;
+            let swap = sandbox
+                .pending_volume_swap
+                .lock()
+                .unwrap()
+                .take()
+                .expect("pending swap");
+            assert_eq!(swap.slots.len(), 2.max(new_count));
+            assert_eq!(swap.new_drives.len(), new_count);
+            assert_eq!(
+                swap.old_mounts,
+                vec![(1, PathBuf::from("/data")), (2, PathBuf::from("/models"))]
+            );
+            for (slot, old) in swap.slots.iter().zip(&staged) {
+                let path = sandbox.work_dir.path().join(&slot.attachment_path);
+                assert_eq!(fs::read_link(&path)?, old.attachment_path);
+                sandbox.reset_volume_drive_slot(slot)?;
+                let metadata = fs::symlink_metadata(path)?;
+                assert!(metadata.file_type().is_file());
+                assert_eq!(metadata.len(), VOLUME_DRIVE_PLACEHOLDER_SIZE);
+            }
+            assert!(sandbox.pending_volume_swap.lock().unwrap().is_none());
+        }
         Ok(())
     }
 
@@ -3213,6 +3445,7 @@ mod tests {
             extra_mmds: serde_json::Map::new(),
             extra_drives: Vec::new(),
             extra_drives_in_snapshot: false,
+            replaced_snapshot_drives: Vec::new(),
             custom_extension_params: None,
             envd_access_token: None,
         };

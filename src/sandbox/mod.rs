@@ -5,6 +5,7 @@ mod envd;
 mod extra_drive;
 mod firecracker;
 mod guest_volumes;
+pub use guest_volumes::SnapshotMountBusy;
 pub(crate) mod logs;
 mod metrics;
 #[cfg(test)]
@@ -87,6 +88,9 @@ pub struct SandboxLaunchConfig {
     /// Whether `extra_drives` already occupy reserved slots in the source
     /// Firecracker state and can be bound before snapshot load.
     pub extra_drives_in_snapshot: bool,
+    /// Old snapshot drives in reserved-slot order, used only when
+    /// `extra_drives_in_snapshot` is false, until the guest releases their filesystems.
+    pub replaced_snapshot_drives: Vec<ExtraDrive>,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Takes precedence over any value persisted in the source snapshot.
     pub custom_extension_params: Option<CustomExtensionParams>,
@@ -105,6 +109,7 @@ impl SandboxLaunchConfig {
             extra_mmds: serde_json::Map::new(),
             extra_drives: Vec::new(),
             extra_drives_in_snapshot: false,
+            replaced_snapshot_drives: Vec::new(),
             custom_extension_params: None,
             envd_access_token: None,
         }

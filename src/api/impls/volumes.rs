@@ -10,12 +10,69 @@ use agentenv_http_server::apis::volumes::*;
 use agentenv_http_server::models;
 
 use crate::sandbox::{normalize_mount_path, ExtraDrive};
+use crate::snapshot::SnapshotVolume;
 use crate::volume::{
     VolumeError, VolumeManager, VolumeMode, VolumeRecord, VolumeStatus, DEFAULT_VOLUME_PAGE_SIZE,
     DEFAULT_VOLUME_SIZE_MB,
 };
 
 use super::ApiImpl;
+
+pub(super) struct StagedSnapshotDrives {
+    pub(super) drives: Vec<ExtraDrive>,
+    pub(super) _dir: tempfile::TempDir,
+}
+
+pub(super) async fn stage_snapshot_volume_drives(
+    manager: &VolumeManager,
+    snapshots: &[SnapshotVolume],
+) -> Result<StagedSnapshotDrives, models::Error> {
+    let root = manager.staging_root();
+    std::fs::create_dir_all(&root)
+        .map_err(|error| ApiImpl::error(500, format!("create volume staging root: {error}")))?;
+    let dir = tempfile::tempdir_in(root).map_err(|error| {
+        ApiImpl::error(500, format!("create volume staging directory: {error}"))
+    })?;
+    let mut snapshots = snapshots
+        .iter()
+        .map(|snapshot| {
+            normalize_mount_path(PathBuf::from(&snapshot.mount_path))
+                .map(|path| (path, snapshot))
+                .map_err(|error| ApiImpl::error(400, error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // resolve_volume_mounts assigns reserved slots in mount-path order. Snapshot
+    // manifests have no slot field, so restore the same order before loading memory.
+    snapshots.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    let mut drives = Vec::with_capacity(snapshots.len());
+    for (index, (mount_path, snapshot)) in snapshots.into_iter().enumerate() {
+        let config = manager
+            .materialize_staging_layers(
+                &snapshot.layers,
+                &dir.path().join(index.to_string()).join("image.json"),
+            )
+            .await
+            .map_err(|error| error_response(error).1)?;
+        let drive = ExtraDrive::try_new_overlaybd_with_mount_path(
+            format!("staged_{index}"),
+            config,
+            snapshot.mode == VolumeMode::ReadOnly,
+            mount_path,
+            None::<PathBuf>,
+        )
+        .and_then(|drive| {
+            drive.try_with_virtual_size(
+                snapshot
+                    .size_mb
+                    .checked_mul(1024 * 1024)
+                    .ok_or_else(|| anyhow::anyhow!("volume size is too large"))?,
+            )
+        })
+        .map_err(|error| ApiImpl::error(400, error.to_string()))?;
+        drives.push(drive);
+    }
+    Ok(StagedSnapshotDrives { drives, _dir: dir })
+}
 
 pub(super) async fn resolve_volume_mounts(
     manager: &VolumeManager,
@@ -310,5 +367,75 @@ impl Volumes<()> for ApiImpl {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
+
+    #[tokio::test]
+    async fn staged_snapshot_drives_preserve_slot_order_mode_and_size_without_volumes() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: root.path().join("repository"),
+            cache_root: Some(root.path().join("cache")),
+            runtime_cache_root: Some(root.path().join("runtime")),
+        })
+        .unwrap();
+        let manager =
+            VolumeManager::open_with_repository(root.path().join("volumes"), backend.repository())
+                .await
+                .unwrap();
+        let layers = vec![crate::snapshot::OverlaybdLayerRef::External(
+            crate::snapshot::ExternalLayer {
+                repo_blob_url: "https://registry.example/v2/data/blobs".into(),
+                digest: format!("sha256:{}", "0".repeat(64)),
+                size: 4096,
+            },
+        )];
+        let snapshots = vec![
+            SnapshotVolume {
+                mount_path: "/z//data/".into(),
+                mode: VolumeMode::Exclusive,
+                size_mb: 32,
+                layers: layers.clone(),
+            },
+            SnapshotVolume {
+                mount_path: "/a".into(),
+                mode: VolumeMode::ReadOnly,
+                size_mb: 16,
+                layers,
+            },
+        ];
+        let staged = stage_snapshot_volume_drives(&manager, &snapshots)
+            .await
+            .unwrap();
+        assert_eq!(staged.drives.len(), 2);
+        for (index, (path, read_only, size)) in [("/a", true, 16), ("/z/data", false, 32)]
+            .into_iter()
+            .enumerate()
+        {
+            let drive = &staged.drives[index];
+            assert_eq!(drive.drive_id(), format!("staged_{index}"));
+            assert_eq!(drive.mount_path(), std::path::Path::new(path));
+            assert_eq!(drive.read_only(), read_only);
+            assert_eq!(drive.virtual_size(), Some(size * 1024 * 1024));
+            assert!(!drive.is_volume());
+            assert!(drive.snapshot_output_dir().is_none());
+            let config = overlaybd::config::load_image_config(drive.image_config_path()).unwrap();
+            assert!(config.upper.data.is_empty());
+            assert!(manager.get(drive.drive_id()).await.is_err());
+        }
+        let staging_path = staged._dir.path().to_path_buf();
+        drop(staged);
+        assert!(!staging_path.exists());
+        assert!(manager
+            .list_page(None, 100)
+            .await
+            .unwrap()
+            .records
+            .is_empty());
     }
 }

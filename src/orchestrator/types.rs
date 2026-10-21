@@ -33,6 +33,9 @@ pub struct CreateSandboxRequest {
     /// Firecracker state. Restored volume snapshots can be bound before load;
     /// newly requested volumes must replace placeholders after load.
     pub extra_drives_in_snapshot: bool,
+    /// Old snapshot drives in reserved-slot order, used only when
+    /// `extra_drives_in_snapshot` is false, until the guest releases their filesystems.
+    pub replaced_snapshot_drives: Vec<crate::sandbox::ExtraDrive>,
     pub timeout: Option<Duration>,
     pub timeout_action: super::SandboxTimeoutAction,
     pub auto_resume: bool,

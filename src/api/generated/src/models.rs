@@ -3986,6 +3986,7 @@ pub struct NewSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<Nullable<std::collections::HashMap<String, crate::types::Object>>>,
 
+    /// Explicit values replace all snapshot volume mounts; an empty array removes them all. Omit to restore the snapshot mounts. Returns 409 if a snapshot filesystem is still in use by a guest process.
     #[serde(rename = "volumeMounts")]
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4303,6 +4304,7 @@ pub struct NewSandboxV2 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<Nullable<std::collections::HashMap<String, crate::types::Object>>>,
 
+    /// Explicit values replace all snapshot volume mounts; an empty array removes them all. Omit to restore the snapshot mounts. Returns 409 if a snapshot filesystem is still in use by a guest process.
     #[serde(rename = "volumeMounts")]
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]

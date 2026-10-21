@@ -18,7 +18,7 @@ use crate::orchestrator::{
 };
 use crate::prometheus::SandboxStageTimer;
 use crate::sandbox::custom_extension::HookStatusError;
-use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive};
+use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive, SnapshotMountBusy};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotVolume,
@@ -31,7 +31,9 @@ use agentenv_http_server::types::Nullable;
 
 use super::attached_drives::resolve_attached_drives;
 use super::pagination::PaginationCursor;
-use super::volumes::{error_response as volume_error_response, resolve_volume_mounts};
+use super::volumes::{
+    error_response as volume_error_response, resolve_volume_mounts, stage_snapshot_volume_drives,
+};
 use super::ApiImpl;
 
 fn sandbox_not_found(id: impl Into<String>) -> models::Error {
@@ -47,6 +49,13 @@ fn hook_status_error(err: &OrchestratorError) -> Option<&HookStatusError> {
     source
         .chain()
         .find_map(|cause| cause.downcast_ref::<HookStatusError>())
+}
+
+fn snapshot_mount_busy_error(err: &OrchestratorError) -> Option<&SnapshotMountBusy> {
+    let OrchestratorError::SandboxOperationFailed { source, .. } = err else {
+        return None;
+    };
+    source.chain().find_map(|cause| cause.downcast_ref())
 }
 
 /// Error message to surface to the caller as a client error (4xx) when the
@@ -804,6 +813,7 @@ impl Sandboxes<()> for ApiImpl {
             },
             extra_drives: Vec::new(),
             extra_drives_in_snapshot: false,
+            replaced_snapshot_drives: Vec::new(),
             timeout: duration_from_secs(body.timeout),
             timeout_action: match body.auto_pause {
                 Some(false) => SandboxTimeoutAction::Delete,
@@ -1088,6 +1098,27 @@ impl Sandboxes<()> for ApiImpl {
 
         let extra_drives_in_snapshot =
             body.volume_mounts.is_none() && !snapshot.committed().volume_snapshots.is_empty();
+        // Keep the temporary configs alive through create_sandbox. They describe
+        // the disks matching guest memory until its old filesystems are released.
+        let staged_snapshot_drives =
+            if body.volume_mounts.is_some() && !snapshot.committed().volume_snapshots.is_empty() {
+                match stage_snapshot_volume_drives(
+                    &self.volume_manager,
+                    &snapshot.committed().volume_snapshots,
+                )
+                .await
+                {
+                    Ok(staged) => Some(staged),
+                    Err(error) => {
+                        return Ok(match error.code {
+                            500.. => SandboxesPostResponse::Status500_ServerError(error),
+                            _ => SandboxesPostResponse::Status400_BadRequest(error),
+                        });
+                    }
+                }
+            } else {
+                None
+            };
         let (requested_volume_mounts, restored_volume_ids) = if let Some(mounts) =
             body.volume_mounts.as_deref()
         {
@@ -1130,6 +1161,10 @@ impl Sandboxes<()> for ApiImpl {
             source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
             extra_drives: volume_drives,
             extra_drives_in_snapshot,
+            replaced_snapshot_drives: staged_snapshot_drives
+                .as_ref()
+                .map(|staged| staged.drives.clone())
+                .unwrap_or_default(),
             timeout: duration_from_secs(body.timeout),
             timeout_action: match body.auto_pause {
                 Some(false) => SandboxTimeoutAction::Delete,
@@ -1190,6 +1225,12 @@ impl Sandboxes<()> for ApiImpl {
                 )
                 .await;
                 cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                if let Some(error) = snapshot_mount_busy_error(&err) {
+                    return Ok(SandboxesPostResponse::Status409_Conflict(Self::error(
+                        409,
+                        error.to_string(),
+                    )));
+                }
                 // The custom extension rejected the start hook with a 4xx
                 // (start-resume for template-based creates).
                 if let Some(message) = hook_client_error_message(&err) {
@@ -2189,6 +2230,32 @@ mod tests {
     use super::*;
     use crate::orchestrator::SandboxOperation;
     use crate::sandbox::SandboxCaptureError;
+
+    #[test]
+    fn snapshot_mount_busy_error_survives_context_and_ignores_other_errors() {
+        let err = OrchestratorError::SandboxOperationFailed {
+            sandbox_id: SandboxId::new(),
+            operation: SandboxOperation::Start,
+            source: anyhow::Error::new(SnapshotMountBusy {
+                mount_path: "/data".into(),
+                detail: "non-lazy umount failed".into(),
+            })
+            .context("wait for sandbox readiness"),
+        };
+        let busy = snapshot_mount_busy_error(&err).expect("typed error in chain");
+        assert_eq!(busy.mount_path, std::path::Path::new("/data"));
+        assert!(busy.to_string().contains("non-lazy umount failed"));
+        assert!(
+            snapshot_mount_busy_error(&OrchestratorError::SandboxNotFound(SandboxId::new()))
+                .is_none()
+        );
+        let err = OrchestratorError::SandboxOperationFailed {
+            sandbox_id: SandboxId::new(),
+            operation: SandboxOperation::Start,
+            source: anyhow::anyhow!("unrelated failure"),
+        };
+        assert!(snapshot_mount_busy_error(&err).is_none());
+    }
 
     #[test]
     fn hook_status_error_found_in_direct_anyhow_chain() {

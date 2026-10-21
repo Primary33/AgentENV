@@ -1173,6 +1173,7 @@ fn create_request(
         source: SandboxLaunchSource::Snapshot(Box::new(RunnableSnapshot::mock())),
         extra_drives: Vec::new(),
         extra_drives_in_snapshot: false,
+        replaced_snapshot_drives: Vec::new(),
         timeout: timeout_secs.map(Duration::from_secs),
         timeout_action: SandboxTimeoutAction::Pause,
         user_metadata,
@@ -1183,6 +1184,23 @@ fn create_request(
         auto_resume: false,
         secure: false,
     }
+}
+
+#[tokio::test]
+async fn create_sandbox_forwards_replaced_snapshot_drives() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone())).await;
+    let staged = crate::sandbox::ExtraDrive::try_new_overlaybd("staged_0", "/tmp/old.json", true)?;
+    let mut request = create_request(Some(60), &[]);
+    request.replaced_snapshot_drives = vec![staged.clone()];
+    let created = orchestrator.create_sandbox(request).await?;
+    let launch = behavior.launch_config().expect("backend launch config");
+    assert_eq!(launch.replaced_snapshot_drives, vec![staged]);
+    assert!(!launch.extra_drives_in_snapshot);
+    orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
 }
 
 fn write_local_commit_image_config(path: &Path, file: &Path, digest: &str, size: u64) {
@@ -1237,6 +1255,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
             },
             extra_drives: Vec::new(),
             extra_drives_in_snapshot: false,
+            replaced_snapshot_drives: Vec::new(),
             timeout: Some(Duration::from_secs(60)),
             timeout_action: SandboxTimeoutAction::Pause,
             user_metadata: None,

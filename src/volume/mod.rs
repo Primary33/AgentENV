@@ -278,6 +278,21 @@ impl VolumeManager {
         Ok(record)
     }
 
+    /// Temporary configs only: staging must not create or update durable volumes.
+    pub(crate) async fn materialize_staging_layers(
+        &self,
+        layers: &[OverlaybdLayerRef],
+        destination: &Path,
+    ) -> Result<PathBuf, VolumeError> {
+        crate::repository::materialize_volume_backing(self.repository.as_ref(), layers, destination)
+            .await
+            .map_err(repository_error)
+    }
+
+    pub(crate) fn staging_root(&self) -> PathBuf {
+        self.root.join("data").join(".staging")
+    }
+
     pub async fn create(
         &self,
         name: String,

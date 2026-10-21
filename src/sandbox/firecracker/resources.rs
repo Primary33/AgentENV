@@ -1,6 +1,7 @@
 //! Host resources a running Firecracker sandbox owns.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -36,6 +37,8 @@ pub(super) struct SandboxResources {
     pub(super) mem_dedicated_device: Option<UblkDevice>,
     pub(super) startup_prefetch_task: Option<LocalStartupPrefetch>,
     pub(super) extra_drive_runtimes: Vec<OverlaybdRuntimeHandle>,
+    /// Snapshot backing retained until the guest has released its old superblocks.
+    pub(super) staged_drive_runtimes: Mutex<Vec<OverlaybdRuntimeHandle>>,
     /// Delivers the custom extension stop hook exactly once: `release()` calls
     /// [`CustomExtensionHookGuard::stop`], otherwise its own drop fires the
     /// best-effort notification. `None` when no start hook was delivered (or
@@ -97,6 +100,15 @@ impl SandboxResources {
             }
         }
 
+        for runtime in self.staged_drive_runtimes.get_mut().unwrap().drain(..) {
+            if let Err(error) = UblkDeviceManager::global()
+                .release_device(&runtime.device)
+                .await
+            {
+                warn!(%error, "failed to release staged snapshot drive during stop");
+            }
+        }
+
         // Invoke the stop hook before releasing network resources. Delivery
         // failures are logged inside the client and never fail stop().
         if let Some(guard) = self.custom_extension_hook_guard.take() {
@@ -150,6 +162,7 @@ impl Drop for SandboxResources {
         // explicitly deleted on the stop() path and otherwise cleaned up when
         // the daemon shuts down.
         self.extra_drive_runtimes.clear();
+        self.staged_drive_runtimes.get_mut().unwrap().clear();
         if let Some(slot) = self.network_slot.take() {
             if let Err(e) = NetworkManager::global().release(slot) {
                 warn!(error = %e, "failed to release network slot on drop");
