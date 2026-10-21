@@ -155,6 +155,20 @@ fn volume_mounts_from_model(
     Ok(Some(result))
 }
 
+fn check_snapshot_volume_replacement(
+    snapshot_volumes: &[SnapshotVolume],
+    explicit_mounts: bool,
+) -> Result<(), models::Error> {
+    if explicit_mounts && !snapshot_volumes.is_empty() {
+        return Err(ApiImpl::error(
+            400,
+            "this snapshot has volume mounts, which cannot be replaced; \
+             omit volumeMounts to restore them",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct PreparedVolumeMounts {
     owner: Option<String>,
@@ -1084,6 +1098,13 @@ impl Sandboxes<()> for ApiImpl {
                 400,
                 err.to_string(),
             )));
+        }
+
+        if let Err(error) = check_snapshot_volume_replacement(
+            &snapshot.committed().volume_snapshots,
+            body.volume_mounts.is_some(),
+        ) {
+            return Ok(SandboxesPostResponse::Status400_BadRequest(error));
         }
 
         let extra_drives_in_snapshot =
@@ -2257,6 +2278,23 @@ mod tests {
         };
         assert!(hook_status_error(&err).is_none());
         assert!(hook_client_error_message(&err).is_none());
+    }
+
+    #[test]
+    fn snapshot_volume_replacement_requires_implicit_mounts() {
+        let snapshot_volumes = [SnapshotVolume {
+            mount_path: "/volume".to_string(),
+            mode: VolumeMode::Exclusive,
+            size_mb: 16,
+            layers: Vec::new(),
+        }];
+
+        assert!(check_snapshot_volume_replacement(&[], true).is_ok());
+        assert!(check_snapshot_volume_replacement(&snapshot_volumes, false).is_ok());
+
+        let error = check_snapshot_volume_replacement(&snapshot_volumes, true)
+            .expect_err("explicit mounts must not replace snapshot volumes");
+        assert_eq!(error.code, 400);
     }
 
     #[test]

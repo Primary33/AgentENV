@@ -198,7 +198,8 @@ Reuse shared helpers: `src/local_store.rs` (`LocalKvStore`, explicit
   Reject deletion while mounted and new mounts while `uploading`/`failed`.
   Fork exclusive volumes per child, share read-only volumes, and roll back failed
   child allocations. Snapshots store `volume_snapshots` separately from attached
-  drives; launches recreate volumes unless explicit `volumeMounts` replaces them.
+  drives; launches recreate volumes and reject explicit `volumeMounts` (including
+  empty arrays) for snapshots that have volumes.
   Deleting a source volume must not invalidate committed snapshots.
 - **Registries:** Use configured `regctl` and `ImageResolver`. Preserve lazy reads
   for OverlayBD-native images. Private registries use the runtime user's Docker

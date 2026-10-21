@@ -686,6 +686,10 @@ components:
           $ref: "#/components/schemas/Mcp"
         volumeMounts:
           type: array
+          description: >
+            Volumes to mount. If the snapshot already has volume mounts,
+            providing this field, including an empty array, returns HTTP 400.
+            Omit this field to restore the snapshot's volumes.
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
 
@@ -728,6 +732,10 @@ components:
           $ref: "#/components/schemas/Mcp"
         volumeMounts:
           type: array
+          description: >
+            Volumes to mount. If the snapshot already has volume mounts,
+            providing this field, including an empty array, returns HTTP 400.
+            Omit this field to restore the snapshot's volumes.
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
 

@@ -163,4 +163,27 @@ assert_not_eq "${restored_volume_id}" "${source_volume_id}" \
 CREATED_VOLUME_IDS+=("${restored_volume_id}")
 verify_volume_files "${restored_sandbox_id}"
 
+for endpoint in "/sandboxes" "/v2/sandboxes"; do
+  for volume_mounts in \
+    "$(jq -nc --arg name "${source_volume_id}" --arg path "${VOLUME_MOUNT_PATH}" \
+      '[{name: $name, path: $path}]')" \
+    '[]'; do
+    api_post "${endpoint}" "$(jq -nc \
+      --arg snapshot_id "${snapshot_id}" \
+      --argjson volume_mounts "${volume_mounts}" \
+      '{
+        templateID: $snapshot_id,
+        timeout: 300,
+        autoPause: false,
+        volumeMounts: $volume_mounts
+      }')"
+    unexpected_sandbox_id="$(echo "${HTTP_BODY}" | jq -r '.sandboxID // empty')"
+    if [[ -n "${unexpected_sandbox_id}" ]]; then
+      track_sandbox "${unexpected_sandbox_id}"
+    fi
+    assert_status "${HTTP_STATUS}" "400" \
+      "${endpoint} rejects snapshot volume replacement with ${volume_mounts}"
+  done
+done
+
 suite_summary "15_volume"

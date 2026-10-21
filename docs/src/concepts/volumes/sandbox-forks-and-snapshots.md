@@ -26,6 +26,11 @@ Starting a sandbox from that snapshot creates new volumes with the captured
 contents and mounts them at the same paths. An exclusive volume remains
 exclusive; a read-only volume remains read-only.
 
+Volume mounts captured in a sandbox snapshot cannot be replaced at launch.
+If the snapshot has volume mounts, providing `volumeMounts`, including an empty
+array, returns HTTP 400. Omit the field to restore the captured volumes.
+Templates still accept explicit mounts, as do snapshots without volume mounts.
+
 Volume snapshots are independent from their source volumes. Deleting a source
 volume does not remove volume data already committed into a sandbox snapshot.
 

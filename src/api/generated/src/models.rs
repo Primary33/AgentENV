@@ -3986,6 +3986,7 @@ pub struct NewSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<Nullable<std::collections::HashMap<String, crate::types::Object>>>,
 
+    /// Volumes to mount. If the snapshot already has volume mounts, providing this field, including an empty array, returns HTTP 400. Omit this field to restore the snapshot's volumes.
     #[serde(rename = "volumeMounts")]
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4303,6 +4304,7 @@ pub struct NewSandboxV2 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<Nullable<std::collections::HashMap<String, crate::types::Object>>>,
 
+    /// Volumes to mount. If the snapshot already has volume mounts, providing this field, including an empty array, returns HTTP 400. Omit this field to restore the snapshot's volumes.
     #[serde(rename = "volumeMounts")]
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]

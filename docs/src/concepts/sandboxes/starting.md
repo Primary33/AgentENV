@@ -30,7 +30,7 @@ Warm-start options:
 |---|---|---|
 | `<template-or-snapshot>` | Required | Template or snapshot ID or alias. |
 | `--timeout <seconds>` | `300` | Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see [Auto-Eviction](./auto-eviction.md). |
-| `--volume <mount-path>=<volume>` | None | Mount a persistent volume by ID or name. Repeat the option to mount multiple volumes. |
+| `--volume <mount-path>=<volume>` | None | Mount a persistent volume by ID or name. Repeat the option to mount multiple volumes. Not allowed when the snapshot already has volume mounts. |
 | `-d`, `--detach` | Off | Print the sandbox ID and exit instead of attaching an interactive shell. |
 
 Without `--detach`, `aenv start` waits for the sandbox to become ready and then
