@@ -30,9 +30,7 @@ enum Cmd {
     Build(Box<commands::build::Args>),
     /// Start a sandbox and attach an interactive shell
     Start(commands::start::Args),
-    /// Guest Compose runtime
-    #[cfg(target_os = "linux")]
-    #[command(hide = true)]
+    /// Run a Compose project in a sandbox
     Compose(commands::compose::Args),
     /// Run a command in a sandbox
     Exec(commands::exec::Args),
@@ -87,7 +85,6 @@ fn main() -> Result<()> {
         Cmd::Pull(a) => commands::pull::run(a),
         Cmd::Build(a) => commands::build::run(*a),
         Cmd::Start(a) => commands::start::run(a),
-        #[cfg(target_os = "linux")]
         Cmd::Compose(a) => commands::compose::run(a),
         Cmd::Exec(a) => commands::exec::run(a),
         Cmd::Upload(a) => commands::upload::run(a),

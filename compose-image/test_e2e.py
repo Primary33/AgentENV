@@ -108,6 +108,25 @@ class ComposeE2E(unittest.TestCase):
                                                  "x-agentenv-target-port": str(port)}, raw=True).strip()
 
 
+    def test_cli_compose_up(self):
+        source = COMPOSE.replace("  b:\n", "  b:\n    profiles: [worker]\n")
+        compose_file = self.work / "compose.yaml"
+        compose_file.write_text(source)
+        cli = os.environ.get("AENV_CLI", "aenv")
+        result = subprocess.run([
+            cli, "compose", "up", "-f", str(compose_file), "--profile", "worker",
+            "--env", "VALUE=old", "--env", "VALUE=$literal=cli", "--cpu", "2",
+            "--memory", "2048", "--timeout", "600",
+        ], env=self.env, capture_output=True, text=True, timeout=670)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sandbox = result.stdout.strip()
+        self.sandboxes.append(sandbox)
+        self.assertEqual(len(sandbox.splitlines()), 1)
+        self.assertEqual(self.proxy(sandbox, 8080), "a")
+        self.assertEqual(self.proxy(sandbox, 8081), "b")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-a-1", "printenv", "VALUE"),
+                         "$literal=cli")
+
     def test_lifecycle(self):
         sandbox = self.create()
         print("created two services using the same source image", flush=True)

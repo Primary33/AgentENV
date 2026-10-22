@@ -302,7 +302,7 @@ Configure `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` with the same value on every run
 
 ## `[compose]`
 
-Optional runtime for image-only Compose sandboxes.
+Optional runtime for image-only Compose sandboxes. See [Compose projects](../concepts/sandboxes/starting.md#compose-projects).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

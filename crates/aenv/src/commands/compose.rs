@@ -1,5 +1,28 @@
-use anyhow::Result;
+use super::start::parse_disk_size_mb;
+use crate::client::{handle_status, sandboxes::Sandbox, Client};
+use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
+use serde::Serialize;
+use std::collections::HashMap;
+use std::io::Read;
+use std::path::PathBuf;
+use std::time::Duration;
+
+pub(crate) fn parse_env(value: &str) -> std::result::Result<(String, String), String> {
+    let (key, value) = value
+        .split_once('=')
+        .filter(|(key, _)| !key.is_empty())
+        .ok_or_else(|| "expected KEY=VALUE with a non-empty key".to_owned())?;
+    Ok((key.to_owned(), value.to_owned()))
+}
+
+pub(crate) fn read_compose(mut reader: impl Read) -> Result<String> {
+    let mut compose = String::new();
+    reader
+        .read_to_string(&mut compose)
+        .context("reading Compose source as UTF-8")?;
+    Ok(compose)
+}
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -9,14 +32,204 @@ pub struct Args {
 
 #[derive(Subcommand)]
 enum Sub {
+    /// Create a sandbox, wait for Compose readiness, and print its ID
+    Up(UpArgs),
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
     GuestInit,
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
     GuestStart,
+}
+
+#[derive(ClapArgs)]
+#[command(after_help = "Examples:
+  aenv compose up -f compose.yaml --cpu 2 --memory 2048
+  aenv compose up -f compose.yaml --env TAG=stable --profile worker
+  cat compose.yaml | aenv compose up -f -
+
+Each invocation creates a new sandbox. Manage it with aenv exec, connect, pause,
+resume, snapshot, and delete. Only explicit --env values are used for interpolation;
+the local environment and .env files are not loaded.")]
+struct UpArgs {
+    /// Compose YAML or JSON file; use - to read stdin
+    #[arg(short = 'f', long, default_value = "compose.yaml", value_name = "PATH")]
+    file: PathBuf,
+    /// Compose interpolation variable (repeatable; last value wins)
+    #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env)]
+    environment: Vec<(String, String)>,
+    /// Enable an optional Compose profile (repeatable)
+    #[arg(long = "profile", value_name = "NAME")]
+    profiles: Vec<String>,
+    /// Sandbox TTL in seconds, starting after Compose is ready
+    #[arg(long, default_value_t = super::DEFAULT_TIMEOUT_SECS)]
+    timeout: u32,
+    #[command(flatten)]
+    resources: super::CpuMemoryArgs,
+    /// Root filesystem size in MiB (must be divisible by 1024)
+    #[arg(long = "disk-size-mb", alias = "disk-mb", value_parser = parse_disk_size_mb)]
+    disk_size_mb: Option<u32>,
 }
 
 pub fn run(args: Args) -> Result<()> {
     match args.cmd {
+        Sub::Up(args) => up(args),
+        #[cfg(target_os = "linux")]
         Sub::GuestInit => runtime::run(false),
+        #[cfg(target_os = "linux")]
         Sub::GuestStart => runtime::run(true),
+    }
+}
+
+fn up(args: UpArgs) -> Result<()> {
+    let compose = if args.file == std::path::Path::new("-") {
+        read_compose(std::io::stdin().lock())?
+    } else {
+        let file = std::fs::File::open(&args.file)
+            .with_context(|| format!("opening Compose file {}", args.file.display()))?;
+        read_compose(file)?
+    };
+    let body = NewComposeSandbox {
+        compose: &compose,
+        compose_env: args.environment.into_iter().collect(),
+        profiles: args.profiles,
+        timeout: args.timeout,
+        cpu_count: args.resources.cpu_count,
+        memory_mb: args.resources.memory_mb,
+        disk_size_mb: args.disk_size_mb,
+    };
+    let client = Client::from_env()?;
+    eprintln!("Starting Compose sandbox; waiting for services to become ready...");
+    let sandbox = create_compose_sandbox(&client, &body)?;
+    println!("{}", sandbox.sandbox_id);
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct NewComposeSandbox<'a> {
+    compose: &'a str,
+    #[serde(skip_serializing_if = "HashMap::is_empty", rename = "composeEnv")]
+    compose_env: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    profiles: Vec<String>,
+    timeout: u32,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "cpuCount")]
+    cpu_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "memoryMB")]
+    memory_mb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "diskSizeMB")]
+    disk_size_mb: Option<u32>,
+}
+
+fn create_compose_sandbox(client: &Client, body: &NewComposeSandbox<'_>) -> Result<Sandbox> {
+    // Allow preparation, VM startup and cleanup beyond the guest's 300s budget.
+    // Wait longer than the gateway's 600s minimum so it can report errors.
+    let timeout = Duration::from_secs(660);
+    let request = client.post("/sandboxes-compose").timeout(timeout);
+    let resp = handle_status(request.send_json(body))?;
+    Ok(resp.into_json()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn preserves_compose_source_and_requires_utf8() {
+        let source = "services: {app: {image: '${IMAGE}', command: ['echo', '$$HOME']}}\n";
+        assert_eq!(read_compose(source.as_bytes()).unwrap(), source);
+        assert!(read_compose(&[0xff][..]).is_err());
+    }
+
+    fn parse(arguments: &[&str]) -> UpArgs {
+        let crate::Cmd::Compose(Args { cmd: Sub::Up(args) }) =
+            crate::Cli::try_parse_from(arguments).unwrap().cmd
+        else {
+            panic!("expected compose up");
+        };
+        args
+    }
+
+    #[test]
+    fn accepts_profiles_explicit_environment_and_resource_aliases() {
+        crate::Cli::command().debug_assert();
+        let args = parse(&[
+            "aenv",
+            "compose",
+            "up",
+            "-f",
+            "-",
+            "--profile",
+            "web",
+            "--profile",
+            "worker",
+            "--env",
+            "VALUE=a=b",
+            "--env",
+            "EMPTY=",
+            "--cpu-count",
+            "2",
+            "--mem",
+            "2048",
+            "--disk-mb",
+            "8192",
+            "--timeout",
+            "600",
+        ]);
+        assert_eq!(args.file, PathBuf::from("-"));
+        assert_eq!(args.profiles, ["web", "worker"]);
+        assert_eq!(
+            args.environment,
+            [("VALUE".into(), "a=b".into()), ("EMPTY".into(), "".into())]
+        );
+        assert_eq!(args.resources.cpu_count, Some(2));
+        assert_eq!(args.resources.memory_mb, Some(2048));
+        assert_eq!(args.disk_size_mb, Some(8192));
+        assert_eq!(args.timeout, 600);
+        let defaults = parse(&["aenv", "compose", "up"]);
+        assert_eq!(defaults.file, PathBuf::from("compose.yaml"));
+        assert!(defaults.environment.is_empty());
+        assert!(defaults.profiles.is_empty());
+        assert!(!defaults.resources.is_set());
+        assert_eq!(defaults.timeout, 300);
+    }
+
+    #[test]
+    fn rejects_invalid_environment_and_disk() {
+        for (flag, value) in [
+            ("--env", "MISSING_VALUE"),
+            ("--env", "=value"),
+            ("--disk-size-mb", "0"),
+            ("--disk-size-mb", "1025"),
+        ] {
+            assert!(crate::Cli::try_parse_from(["aenv", "compose", "up", flag, value]).is_err());
+        }
+    }
+
+    #[test]
+    fn serializes_compose_request() {
+        let request = NewComposeSandbox {
+            compose: "services: {app: {image: '${IMAGE}'}}",
+            compose_env: [("IMAGE".to_owned(), "busybox:1.37".to_owned())].into(),
+            profiles: vec!["worker".to_owned()],
+            timeout: 600,
+            cpu_count: Some(2),
+            memory_mb: Some(2048),
+            disk_size_mb: Some(8192),
+        };
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "compose": request.compose,
+                "composeEnv": {"IMAGE": "busybox:1.37"},
+                "profiles": ["worker"],
+                "timeout": 600,
+                "cpuCount": 2,
+                "memoryMB": 2048,
+                "diskSizeMB": 8192,
+            })
+        );
     }
 }
 
